@@ -1,0 +1,1465 @@
+---
+title: ''
+output: html_document
+date: "2025-04-23"
+---
+
+#Library Set Up
+
+```{r Library Setup}
+#creating percentages and tidying data
+library(dplyr)
+#glm.nb model
+library(MASS)
+#elastic regression
+library(glmnet)
+#AUC binomial model check
+library(pROC)
+#feature importance 
+library(caret)
+#post-hoc contrasts for models 
+library(emmeans)
+#GGPlot for graphing
+library(ggplot2)
+#combining plots
+library(cowplot)
+```
+
+#Import and Clean Data 
+
+````{r Import Data Set}
+setwd("/Users/niamhmccartan/Documents/College/PhD/Papers/CS_Timing/CS_Timing_R")
+
+coldsnap<-read.csv("CS_Timing.csv", 
+                 header = TRUE, 
+                 stringsAsFactors = FALSE)
+```
+```{r Remove early deaths, males and uninfected controls}
+CS <- subset(coldsnap, Include == "Yes")
+```
+```{r Make Treatment Column}
+CS$Treatment <- paste(CS$Amplitude, CS$Duration)
+```
+```{r Set Variables}
+CS$A_Temp<-as.numeric(CS$A_Temp)
+CS$Real_Avg<-as.numeric(CS$Real_Avg)
+CS$Real_CS<-as.numeric(CS$Real_CS)
+CS$Bath<-as.factor(CS$Bath)
+CS$Timing<-as.factor(CS$Timing)
+CS$Amplitude<-as.factor(CS$Amplitude)
+CS$Duration<-as.factor(CS$Duration)
+CS$Infection<-as.numeric(CS$Infection)
+CS$Spores<-as.numeric(CS$Spores)
+CS$Treatment <- as.factor(CS$Treatment)
+```
+```{r Specifying Order of Factors}
+CS$Timing <- factor(CS$Timing, levels = c("Constant", "Before", "During", "After"))
+CS$Amplitude <- factor(CS$Amplitude, levels = c("0", "-3", "-6"))
+CS$Duration <- factor(CS$Duration, levels = c("0", "3", "6"))
+CS$Treatment <- factor(CS$Treatment, levels = c("0 0", "-3 3", "-3 6", "-6 3", "-6 6"))
+```
+```{r Adding Proportion Infected and Standard Error of Burden Column}
+CS = CS %>%
+  group_by(Treatment, A_Temp, Timing) %>% 
+  #Make proportion infected columns 
+  add_count(Treatment) %>% 
+  mutate(
+    nn = sum(Infection != 0),
+    Prop = nn/n,
+  #creating binomial confidence intervals
+  se.I = sqrt(Prop * (1-Prop)/n),
+  lower.I = pmax(Prop - (se.I * 1.96), 0),
+  upper.I = pmin(Prop + (se.I * 1.96), 1)
+  ) %>% 
+  
+  #Make standard error columns
+  mutate(
+    mean = mean(Spores, na.rm = T),
+    sd.B = sd(Spores, na.rm = T),
+    se.B = sd.B/sqrt(n())) %>%
+  ungroup()
+```
+```{r Centre Average Temperature}
+# Centering the 'Real_Avg' variable
+CS$Real_Avg_Cent <- scale(CS$Real_Avg, center = TRUE, scale = TRUE)
+CS$Real_Avg_Cent <- as.numeric(CS$Real_Avg_Cent)
+```
+```{r make Timing_Treatment column}
+CS$Timing_Treatment <- paste(CS$Timing, CS$Treatment)
+CS$Timing_Treatment <- factor(CS$Timing_Treatment, levels = c("Constant 0 0", 	
+                                                    "Before -3 3", "Before -3 6", "Before -6 3", "Before -6 6",
+                                                    "During -3 3", "During -3 6", "During -6 3", "During -6 6",
+                                                    "After -3 3", "After -3 6", "After -6 3", "After -6 6"))
+```
+```{r Extra Subsets}
+# Remove NAs from the data set not relevant as we are only looking at infected individuals
+CS.NA <- na.omit(CS)
+#Subset for only core average temperatures
+CSC <- subset(CS, A_Temp %in% c("14","17","20","23"))
+CSC$A_Temp <- as.factor(CSC$A_Temp)
+```
+```{r Timing Subsets Burden}
+#making a subset by each timing and constant controls 
+CSB.before <- subset(CS.NA, Timing %in% c("Before","Constant")) 
+CSB.during<- subset(CS.NA, Timing %in% c("During","Constant"))
+CSB.after <- subset(CS.NA, Timing %in% c("After","Constant"))
+```
+```{r Timing Subsets Infection}
+#making a subset by each timing and constant controls 
+CSI.before <- subset(CS, Timing %in% c("Before","Constant")) 
+CSI.during <- subset(CS, Timing %in% c("During","Constant"))
+CSI.after <- subset(CS, Timing %in% c("After","Constant"))
+```
+
+```{r Calculate degree day for both my threshold and Kirk et al}
+# STEP 1: Calculate Degree Days for thresholds
+CS.NA$DD_11.2 <- pmax(0, CS.NA$Real_CS - 11.2)
+# STEP 2: Multiply by number of days each individual was alive before dissection
+CS.NA$DD_11.2_total <- CS.NA$DD_11.2 * CS.NA$Day
+#Scale dd to redcue colinearity
+CS.NA$DD_scaled.M <- scale(CS.NA$DD_11.2_total, center = TRUE, scale = TRUE)
+```
+
+#Check Baths
+
+```{r Temperature and Bath Interactions for Infection}
+Bath.treat.CI <- glm(Infection ~ Bath, family = binomial, data = CS)
+summary(Bath.treat.CI)
+
+Bath.Test.treat.CI <- anova(Bath.treat.CI, test = "Chi")
+Bath.Test.treat.CI
+```
+```{r Temperature and Bath Interactions for Burden}
+Bath.CB <- glm.nb(Spores ~ Bath, data = CS)
+summary(Bath.CB)
+
+Bath.Test.CB <- anova(Bath.CB, test = "Chi")
+Bath.Test.CB
+```
+
+#Infection Model
+
+```{r Centred Infection Model}
+#using a quadratic polynomial as it gives the lowest AIC out of the suitable models
+quadratic.treat.CI <- glm(Infection ~ poly(Real_Avg_Cent, 2) * Timing * Treatment, family = binomial, data = CS)
+summary(quadratic.treat.CI)
+```
+```{r Elastic Net Regression for Infection}
+# Prepare the data
+x.treat.CI <- model.matrix(Infection ~ poly(Real_Avg_Cent, 2) * Timing * Treatment, data = CS)  # Create the design matrix
+y.treat.CI <- CS$Infection  # Extract the response variable
+```
+```{r Finding the optimal aplha}
+#trying various alphas to find which one is the most suitable 
+foldid.treat.CI<- sample(1:10, size = length(y.treat.CI), replace = TRUE)
+cv1.treat.CI  <- cv.glmnet(x.treat.CI, y.treat.CI, foldid = foldid.treat.CI, family = "binomial", alpha = 1)
+cv.5.treat.CI <- cv.glmnet(x.treat.CI, y.treat.CI, foldid = foldid.treat.CI, family = "binomial", alpha = 0.5)
+cv0.treat.CI  <- cv.glmnet(x.treat.CI, y.treat.CI, foldid = foldid.treat.CI, family = "binomial", alpha = 0)
+
+par(mfrow = c(2,2))
+plot(cv1.treat.CI); plot(cv.5.treat.CI); plot(cv0.treat.CI)
+plot(log(cv1.treat.CI$lambda)   , cv1.treat.CI$cvm , pch = 19, col = "red",
+     xlab = "log(Lambda)", ylab = cv1.treat.CI$name)
+points(log(cv.5.treat.CI$lambda), cv.5.treat.CI$cvm, pch = 19, col = "grey")
+points(log(cv0.treat.CI$lambda) , cv0.treat.CI$cvm , pch = 19, col = "blue")
+legend("topleft", legend = c("alpha= 1", "alpha= .5", "alpha 0"),
+       pch = 19, col = c("red","grey","blue"))
+
+# Extract minimum mean cross-validated deviance
+min.dev <- c(
+  alpha1  = min(cv1.treat.CI$cvm),
+  alpha05 = min(cv.5.treat.CI$cvm),
+  alpha0  = min(cv0.treat.CI$cvm)
+)
+
+# Print out the minimum deviance for each alpha
+print(min.dev)
+
+```
+```{r Model Fitting}
+# Elastic regression model 
+elfit.b.treat.CI <- cv.glmnet(x.treat.CI, y.treat.CI, family = "binomial", alpha = 0.5)  # Fit a ridge regression model
+
+# Select optimal tuning pattern (lambda) for ridge regression
+opt_lambda.treat.CI <- elfit.b.treat.CI$lambda.min  # Optimal lambda value for regression via CV
+
+# Refit the model using the selected lambda
+elfit.fin.treat.CI <- glmnet(x.treat.CI, y.treat.CI, family = "binomial", alpha = 0.5, lambda = opt_lambda.treat.CI)  
+# Fit the ridge regression model with the selected lambda
+```
+```{r bootstrapped significance testing for the coefficients of infection}
+# Number of bootstrap iterations
+num_bootstraps.treat.CI <- 50000
+
+# Empty list to store bootstrap coefficients
+bootstrap_coefs_list.treat.CI <- vector("list", length = num_bootstraps.treat.CI)
+
+# Set the seed for reproducibility
+set.seed(123)
+
+# Perform bootstrapping
+for (i in 1:num_bootstraps.treat.CI) {
+  # Sample with replacement from the data
+  sample_indices.treat.CI <- sample(nrow(x.treat.CI), replace = TRUE)
+  x_sampled.treat.CI <- x.treat.CI[sample_indices.treat.CI, ]
+  y_sampled.treat.CI <- y.treat.CI[sample_indices.treat.CI]
+  
+  # Fit the elastic net model on the sampled data
+  model_fit.treat.CI <- glmnet(x_sampled.treat.CI, y_sampled.treat.CI, family = "binomial", alpha = 0.5, lambda = opt_lambda.treat.CI)
+  
+  # Store the coefficients in the list
+  bootstrap_coefs_list.treat.CI[[i]] <- as.vector(coef(model_fit.treat.CI, s = opt_lambda.treat.CI))
+}
+
+# Convert the list of bootstrap coefficients to a matrix
+bootstrap_coefs.treat.CI <- do.call(rbind, bootstrap_coefs_list.treat.CI)
+
+# Calculate the 95% confidence intervals for each coefficient
+lower_ci.treat.CI <- apply(bootstrap_coefs.treat.CI, 2, function(coef_col) quantile(coef_col, 0.025))
+upper_ci.treat.CI <- apply(bootstrap_coefs.treat.CI, 2, function(coef_col) quantile(coef_col, 0.975))
+
+# Convert the coefficients to a matrix
+coef_matrix.treat.CI <- as.matrix(coef(elfit.fin.treat.CI, s = opt_lambda.treat.CI))
+
+# Combine the results into a data frame for easy interpretation
+coef_summary.treat.CI <- data.frame(Coefficient = colnames(coef_matrix.treat.CI),
+                              Estimate = coef_matrix.treat.CI,
+                              Lower.treat.CI = lower_ci.treat.CI,
+                              Upper.treat.CI = upper_ci.treat.CI)
+
+# Print the summary
+print(coef_summary.treat.CI)
+```
+```{r Feature Importance for Infection}
+# Extract the coefficients from the final model
+coef_matrix.treat.CI <- as.matrix(coef(elfit.fin.treat.CI, s = opt_lambda.treat.CI))
+
+# Get the absolute values of coefficients to identify feature importance
+feature_importance.treat.CI <- abs(coef_matrix.treat.CI[-1,])
+
+# Sort the features by importance (highest to lowest)
+sorted_features.treat.CI <- feature_importance.treat.CI[order(-feature_importance.treat.CI)]
+
+# Get the corresponding feature names
+sorted_feature_names.treat.CI <- colnames(coef_matrix.treat.CI)[-1][order(-feature_importance.treat.CI)]
+
+# Combine the feature names with the sorted feature importance values
+sorted_feature_importance_table.treat.CI <- data.frame(Feature = sorted_feature_names.treat.CI,
+                                                 Importance = sorted_features.treat.CI)
+
+# Print the sorted feature importance table
+print(sorted_feature_importance_table.treat.CI)
+```
+```{r Model Fit (Area Under the Curve)}
+# Calculate the cross-validated AUC score using the training data
+# The predict() function with type = "response" will give cross-validated predicted probabilities
+cv_predicted_probabilities.treat.CI <- predict(elfit.b.treat.CI, s = "lambda.min", newx = x.treat.CI, type = "response")
+cv_roc_curve.treat.CI <- roc(y.treat.CI, cv_predicted_probabilities.treat.CI)
+cv_auc_score.treat.CI <- auc(cv_roc_curve.treat.CI)
+
+# Print the cross-validated AUC score
+print(paste("Cross-Validated AUC Score:", cv_auc_score.treat.CI))
+```
+
+
+#Infection Contrast Comparisons
+
+```{r Using Spores ~ A_Temp * Treatment_F}
+#Model used 
+Treat.CSI <- glm(Infection ~ A_Temp * Timing_Treatment, family = binomial, data = CSC)
+
+# could also try: family = tweedie(var.power = 2)
+EMM.CSI <- emmeans(Treat.CSI , ~ A_Temp * Timing_Treatment, data = CSC)
+EMM.CSI
+```
+```{r Matrices for Contrasts Spores}
+T14.00C.CSI <- c(1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.00C.CSI <- c(0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0) 
+T20.00C.CSI <- c(0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.00C.CSI <- c(0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.33B.CSI <- c(0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.33B.CSI <- c(0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.33B.CSI <- c(0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.33B.CSI <- c(0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.36B.CSI <- c(0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.36B.CSI <- c(0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.36B.CSI <- c(0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.36B.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.63B.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.63B.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.63B.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.63B.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.66B.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0) 
+T17.66B.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.66B.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.66B.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.33D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.33D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.33D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.33D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.36D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.36D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.36D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.36D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.63D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.63D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.63D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.63D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.66D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.66D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.66D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.66D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.33A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.33A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.33A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.33A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.36A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0)
+T17.36A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0)
+T20.36A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0)
+T23.36A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0)
+T14.63A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0)
+T17.63A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0)
+T20.63A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0)
+T23.63A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0)
+T14.66A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0)
+T17.66A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0)
+T20.66A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0)
+T23.66A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1)
+```
+```{r Custom Contrasts Spores}
+contrast(EMM.CSI, adjust = "BH", method = list(
+  "14 +33B v 00C Before"  = T14.33B.CSI - T14.00C.CSI,
+  "14 +36B v 00C Before"  = T14.36B.CSI - T14.00C.CSI,
+  "14 +63B v 00C Before"  = T14.63B.CSI - T14.00C.CSI,
+  "14 +66B v 00C Before"  = T14.66B.CSI - T14.00C.CSI,
+  "14 +36B v +33B Before" = T14.36B.CSI - T14.33B.CSI,
+  "14 +66B v +63B Before" = T14.66B.CSI - T14.63B.CSI,
+  "14 +63B v +33B Before" = T14.63B.CSI - T14.33B.CSI,
+  "14 +66B v +36B Before" = T14.66B.CSI - T14.36B.CSI,
+  
+  "17 +33B v 00C Before"  = T17.33B.CSI - T17.00C.CSI,
+  "17 +36B v 00C Before"  = T17.36B.CSI - T17.00C.CSI,
+  "17 +63B v 00C Before"  = T17.63B.CSI - T17.00C.CSI,
+  "17 +66B v 00C Before"  = T17.66B.CSI - T17.00C.CSI,
+  "17 +36B v +33B Before" = T17.36B.CSI - T17.33B.CSI,
+  "17 +66B v +63B Before" = T17.66B.CSI - T17.63B.CSI,
+  "17 +63B v +33B Before" = T17.63B.CSI - T17.33B.CSI,
+  "17 +66B v +36B Before" = T17.66B.CSI - T17.36B.CSI,
+  
+  "20 +33B v 00C Before"  = T20.33B.CSI - T20.00C.CSI,
+  "20 +36B v 00C Before"  = T20.36B.CSI - T20.00C.CSI,
+  "20 +63B v 00C Before"  = T20.63B.CSI - T20.00C.CSI,
+  "20 +66B v 00C Before"  = T20.66B.CSI - T20.00C.CSI,
+  "20 +36B v +33B Before" = T20.36B.CSI - T20.33B.CSI,
+  "20 +66B v +63B Before" = T20.66B.CSI - T20.63B.CSI,
+  "20 +63B v +33B Before" = T20.63B.CSI - T20.33B.CSI,
+  "20 +66B v +36B Before" = T20.66B.CSI - T20.36B.CSI, 
+  
+  "23 +33B v 00C Before"  = T23.33B.CSI - T23.00C.CSI,
+  "23 +36B v 00C Before"  = T23.36B.CSI - T23.00C.CSI,
+  "23 +63B v 00C Before"  = T23.63B.CSI - T23.00C.CSI,
+  "23 +66B v 00C Before"  = T23.66B.CSI - T23.00C.CSI,
+  "23 +36B v +33B Before" = T23.36B.CSI - T23.33B.CSI,
+  "23 +66B v +63B Before" = T23.66B.CSI - T23.63B.CSI,
+  "23 +63B v +33B Before" = T23.63B.CSI - T23.33B.CSI,
+  "23 +66B v +36B Before" = T23.66B.CSI - T23.36B.CSI,
+  
+  
+  "14 +33D v 00C During"  = T14.33D.CSI - T14.00C.CSI,
+  "14 +36D v 00C During"  = T14.36D.CSI - T14.00C.CSI,
+  "14 +63D v 00C During"  = T14.63D.CSI - T14.00C.CSI,
+  "14 +66D v 00C During"  = T14.66D.CSI - T14.00C.CSI,
+  "14 +36D v +33D During" = T14.36D.CSI - T14.33D.CSI,
+  "14 +66D v +63D During" = T14.66D.CSI - T14.63D.CSI,
+  "14 +63D v +33D During" = T14.63D.CSI - T14.33D.CSI,
+  "14 +66D v +36D During" = T14.66D.CSI - T14.36D.CSI,
+  
+  "17 +33D v 00C During"  = T17.33D.CSI - T17.00C.CSI,
+  "17 +36D v 00C During"  = T17.36D.CSI - T17.00C.CSI,
+  "17 +63D v 00C During"  = T17.63D.CSI - T17.00C.CSI,
+  "17 +66D v 00C During"  = T17.66D.CSI - T17.00C.CSI,
+  "17 +36D v +33D During" = T17.36D.CSI - T17.33D.CSI,
+  "17 +66D v +63D During" = T17.66D.CSI - T17.63D.CSI,
+  "17 +63D v +33D During" = T17.63D.CSI - T17.33D.CSI,
+  "17 +66D v +36D During" = T17.66D.CSI - T17.36D.CSI,
+  
+  "20 +33D v 00C During"  = T20.33D.CSI - T20.00C.CSI,
+  "20 +36D v 00C During"  = T20.36D.CSI - T20.00C.CSI,
+  "20 +63D v 00C During"  = T20.63D.CSI - T20.00C.CSI,
+  "20 +66D v 00C During"  = T20.66D.CSI - T20.00C.CSI,
+  "20 +36D v +33D During" = T20.36D.CSI - T20.33D.CSI,
+  "20 +66D v +63D During" = T20.66D.CSI - T20.63D.CSI,
+  "20 +63D v +33D During" = T20.63D.CSI - T20.33D.CSI,
+  "20 +66D v +36D During" = T20.66D.CSI - T20.36D.CSI, 
+  
+  "23 +33D v 00C During"  = T23.33D.CSI - T23.00C.CSI,
+  "23 +36D v 00C During"  = T23.36D.CSI - T23.00C.CSI,
+  "23 +63D v 00C During"  = T23.63D.CSI - T23.00C.CSI,
+  "23 +66D v 00C During"  = T23.66D.CSI - T23.00C.CSI,
+  "23 +36D v +33D During" = T23.36D.CSI - T23.33D.CSI,
+  "23 +66D v +63D During" = T23.66D.CSI - T23.63D.CSI,
+  "23 +63D v +33D During" = T23.63D.CSI - T23.33D.CSI,
+  "23 +66D v +36D During" = T23.66D.CSI - T23.36D.CSI,
+  
+  "14 +33A v 00C After"  = T14.33A.CSI - T14.00C.CSI,
+  "14 +36A v 00C After"  = T14.36A.CSI - T14.00C.CSI,
+  "14 +63A v 00C After"  = T14.63A.CSI - T14.00C.CSI,
+  "14 +66A v 00C After"  = T14.66A.CSI - T14.00C.CSI,
+  "14 +36A v +33A After" = T14.36A.CSI - T14.33A.CSI,
+  "14 +66A v +63A After" = T14.66A.CSI - T14.63A.CSI,
+  "14 +63A v +33A After" = T14.63A.CSI - T14.33A.CSI,
+  "14 +66A v +36A After" = T14.66A.CSI - T14.36A.CSI,
+  
+  "17 +33A v 00C After"  = T17.33A.CSI - T17.00C.CSI,
+  "17 +36A v 00C After"  = T17.36A.CSI - T17.00C.CSI,
+  "17 +63A v 00C After"  = T17.63A.CSI - T17.00C.CSI,
+  "17 +66A v 00C After"  = T17.66A.CSI - T17.00C.CSI,
+  "17 +36A v +33A After" = T17.36A.CSI - T17.33A.CSI,
+  "17 +66A v +63A After" = T17.66A.CSI - T17.63A.CSI,
+  "17 +63A v +33A After" = T17.63A.CSI - T17.33A.CSI,
+  "17 +66A v +36A After" = T17.66A.CSI - T17.36A.CSI,
+  
+  "20 +33A v 00C After"  = T20.33A.CSI - T20.00C.CSI,
+  "20 +36A v 00C After"  = T20.36A.CSI - T20.00C.CSI,
+  "20 +63A v 00C After"  = T20.63A.CSI - T20.00C.CSI,
+  "20 +66A v 00C After"  = T20.66A.CSI - T20.00C.CSI,
+  "20 +36A v +33A After" = T20.36A.CSI - T20.33A.CSI,
+  "20 +66A v +63A After" = T20.66A.CSI - T20.63A.CSI,
+  "20 +63A v +33A After" = T20.63A.CSI - T20.33A.CSI,
+  "20 +66A v +36A After" = T20.66A.CSI - T20.36A.CSI, 
+  
+  "23 +33A v 00C After"  = T23.33A.CSI - T23.00C.CSI,
+  "23 +36A v 00C After"  = T23.36A.CSI - T23.00C.CSI,
+  "23 +63A v 00C After"  = T23.63A.CSI - T23.00C.CSI,
+  "23 +66A v 00C After"  = T23.66A.CSI - T23.00C.CSI,
+  "23 +36A v +33A After" = T23.36A.CSI - T23.33A.CSI,
+  "23 +66A v +63A After" = T23.66A.CSI - T23.63A.CSI,
+  "23 +63A v +33A After" = T23.63A.CSI - T23.33A.CSI,
+  "23 +66A v +36A After" = T23.66A.CSI - T23.36A.CSI))
+```
+
+
+#Infection Graphs
+
+```{r Before Infection and Model}
+#making a ggplot plotting by treatment looking at all treatments
+CSI.before.plot <- ggplot(CSI.before, aes(x = A_Temp, y = Prop, colour = Treatment, shape = Treatment, fill = Treatment)) +
+  geom_point(position = position_dodge(width = 0.6), size = 3) +
+  geom_smooth(aes(x = A_Temp, y = Prop, colour = Treatment), lty = "dashed",
+              method = "glm", method.args = list(family = "binomial"), formula = y ~ poly(x,2),
+              se = FALSE, size = 0.75) +
+  geom_errorbar(aes(ymin = lower.I, ymax = upper.I), width = 0.2, position = position_dodge(width = 0.6)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  guides(color = "none") +
+  theme(axis.text = element_text(size = 17),
+        legend.position = "none") + # Remove the legend
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 1)) +
+  scale_shape_manual(values = c(21, 22, 23, 24, 25)) +  # Use shapes 21-25
+  scale_fill_manual(values = c("#999999", "#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +  # Fill colors matching treatments 
+  scale_colour_manual(values = c("#999999", "#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +  
+  scale_x_continuous(breaks = seq(8, 23, 3)) +
+  coord_cartesian(ylim = c(0,1))
+
+CSI.before.plot
+
+ggsave("CSI.before.plot.png", width = 8.5, height = 6)
+```
+```{r During Infection and Model}
+#making a ggplot plotting by treatment looking at all treatments
+CSI.during.plot <- ggplot(CSI.during, aes(x = A_Temp, y = Prop, colour = Treatment, shape = Treatment, fill = Treatment)) +
+  geom_point(position = position_dodge(width = 0.6), size = 3) +
+  geom_smooth(aes(x = A_Temp, y = Prop, colour = Treatment), lty = "dashed",
+              method = "glm", method.args = list(family = "binomial"), formula = y ~ poly(x,2),
+              se = FALSE, size = 0.75) +
+  geom_errorbar(aes(ymin = lower.I, ymax = upper.I), width = 0.2, position = position_dodge(width = 0.6)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  guides(color = "none") +
+  theme(axis.text = element_text(size = 17),
+        legend.position = "none") + # Remove the legend
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 1)) +
+  scale_shape_manual(values = c(21, 22, 23, 24, 25)) +  # Use shapes 21-25
+  scale_fill_manual(values = c("#999999", "#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +  # Fill colors matching treatments 
+  scale_colour_manual(values = c("#999999", "#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +  
+  scale_y_continuous(position = "right") +
+  scale_x_continuous(breaks = seq(8, 23, 3)) +
+  coord_cartesian(ylim = c(0,1))
+
+CSI.during.plot
+
+ggsave("CSI.during.plot.png", width = 8.5, height = 6)
+```
+```{r After Infection and Model}
+#making a ggplot plotting by treatment looking at all treatments
+CSI.after.plot <- ggplot(CSI.after, aes(x = A_Temp, y = Prop, colour = Treatment, shape = Treatment, fill = Treatment)) +
+  geom_point(position = position_dodge(width = 0.6), size = 3) +
+  geom_smooth(aes(x = A_Temp, y = Prop, colour = Treatment), lty = "dashed",
+              method = "glm", method.args = list(family = "binomial"), formula = y ~ poly(x,2),
+              se = FALSE, size = 0.75) +
+  geom_errorbar(aes(ymin = lower.I, ymax = upper.I), width = 0.2, position = position_dodge(width = 0.6)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  guides(color = "none") +
+  theme(axis.text = element_text(size = 17),
+        legend.position = "none") + # Remove the legend
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 1)) +
+  scale_shape_manual(values = c(21, 22, 23, 24, 25)) +  # Use shapes 21-25
+  scale_fill_manual(values = c("#999999", "#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +  # Fill colors matching treatments 
+  scale_colour_manual(values = c("#999999", "#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +  
+  scale_x_continuous(breaks = seq(8, 23, 3)) +
+  coord_cartesian(ylim = c(0,1))
+
+CSI.after.plot
+
+ggsave("CSI.after.plot.png", width = 8.5, height = 6)
+```
+
+#Burden Model
+
+```{r Centred Cubic NB Burden Model}
+#Lowest AIC found a cubic fit was most suitable for the data as it is nonlinear
+#use data set with NAs removed as they were uninfected and so never had a spore burden
+nb.treat.CB <- glm.nb(Spores ~ poly(Real_Avg_Cent, 3) * Timing * Treatment, data = CS.NA)
+summary(nb.treat.CB)
+
+anova.treat.CB <- anova(nb.treat.CB, test = "Chi")
+anova.treat.CB
+```
+```{r Negative Binomial Elastic Regression}
+# Prepare the data
+x.treat.CB <- model.matrix(Spores ~ poly(Real_Avg_Cent, 3) * Timing * Treatment, data = CS.NA)
+y.treat.CB <- CS.NA$Spores
+```
+```{r Finding optimal alpha}
+#different way to find the most suitable alpha but still involves modelling and finding the lowest AIC out of 1, 0.5, 0
+#theta needs to be manually specified in glmnet so we used the theta present in the GLM 
+cv_lasso.treat.CB <- cv.glmnet(x.treat.CB, y.treat.CB, family = negative.binomial(theta = 1.3020), alpha = 0.9)
+cv_mix.treat.CB   <- cv.glmnet(x.treat.CB, y.treat.CB, family = negative.binomial(theta = 1.3020), alpha = 0.87)
+cv_ridge.treat.CB <- cv.glmnet(x.treat.CB, y.treat.CB, family = negative.binomial(theta = 1.3020), alpha = 0.85)
+
+# Calculate number of non-zero coefficients for each model
+num_nonzero_lasso.treat.CB <- sum(coef(cv_lasso.treat.CB, s = 0) != 0)
+num_nonzero_mix.treat.CB <- sum(coef(cv_mix.treat.CB, s = 0) != 0)
+num_nonzero_ridge.treat.CB <- sum(coef(cv_ridge.treat.CB, s = 0) != 0)
+
+# Calculate AIC and BIC
+n.treat.CB <- length(y.treat.CB)
+
+aic_lasso.treat.CB <- n.treat.CB * log(min(cv_lasso.treat.CB$cvm)) + 2 * num_nonzero_lasso.treat.CB
+aic_mix.treat.CB   <- n.treat.CB * log(min(cv_mix.treat.CB$cvm)) + 2 * num_nonzero_mix.treat.CB
+aic_ridge.treat.CB <- n.treat.CB * log(min(cv_ridge.treat.CB$cvm)) + 2 * num_nonzero_ridge.treat.CB
+
+bic_lasso.treat.CB <- n.treat.CB * log(min(cv_lasso.treat.CB$cvm)) + log(n.treat.CB) * num_nonzero_lasso.treat.CB
+bic_mix.treat.CB   <- n.treat.CB * log(min(cv_mix.treat.CB$cvm)) + log(n.treat.CB) * num_nonzero_mix.treat.CB
+bic_ridge.treat.CB <- n.treat.CB * log(min(cv_ridge.treat.CB$cvm)) + log(n.treat.CB) * num_nonzero_ridge.treat.CB
+
+best_alpha_aic.treat.CB <- c(1, 0.99, 0.98)[which.min(c(aic_lasso.treat.CB, aic_mix.treat.CB, aic_ridge.treat.CB))]
+best_alpha_bic.treat.CB <- c(1, 0.99, 0.98)[which.min(c(bic_lasso.treat.CB, bic_mix.treat.CB, bic_ridge.treat.CB))]
+
+data.frame(
+  alpha = c(1, 0.99, 0.98),
+  AIC = c(aic_lasso.treat.CB, aic_mix.treat.CB, aic_ridge.treat.CB),
+  BIC = c(bic_lasso.treat.CB, bic_mix.treat.CB, bic_ridge.treat.CB)
+)
+```
+```{r Initial Model fit}
+# Fit the elastic net model using the theta from the glm.nb 
+elfit.nb.treat.CB <- glmnet(x.treat.CB, y.treat.CB, family = negative.binomial(theta = 1.3020), alpha = 0.87)
+```
+```{r Finding the optimal lambda}
+# Calculate AIC for each lambda
+aic_values <- sapply(elfit.nb.treat.CB$lambda, function(lambda) {
+  fitted_values <- predict(elfit.nb.treat.CB, newx = x.treat.CB, s = lambda, type = "response")
+  logLikelihood <- sum(dnbinom(y.treat.CB, mu = fitted_values, size = 1.3020, log = TRUE))
+  k <- sum(coef(elfit.nb.treat.CB, s = lambda, exact = TRUE) != 0)
+  -2 * logLikelihood + 2 * k
+})
+
+# Calculate BIC for each lambda
+n <- length(y.treat.CB)
+bic_values <- sapply(elfit.nb.treat.CB$lambda, function(lambda) {
+  fitted_values <- predict(elfit.nb.treat.CB, newx = x.treat.CB, s = lambda, type = "response")
+  logLikelihood <- sum(dnbinom(y.treat.CB, mu = fitted_values, size = 1.3020, log = TRUE))
+  k <- sum(coef(elfit.nb.treat.CB, s = lambda, exact = TRUE) != 0)
+  -2 * logLikelihood + log(n) * k
+})
+
+# Print AIC and BIC values
+AIC.BIC.treat.CB <- data.frame(lambda = elfit.nb.treat.CB$lambda, AIC = aic_values, BIC = bic_values)
+```
+```{r Optimal Lambda Elastic Regression}
+lambda.treat.CB <- elfit.nb.treat.CB$lambda
+#set the lambda as the lowest AIC 
+lambda.AIC.treat.CB <- 0.033362992
+
+#final regression with the lowest AIC valued lambda 
+elfit.aic.treat.CB <- glmnet(x.treat.CB, y.treat.CB, family = negative.binomial(theta = 1.3020), alpha = 0.87, lambda = lambda.AIC.treat.CB)
+```
+```{r Bootstrap significance testing for burden}
+# Number of bootstrap iterations
+num_bootstraps.treat.CB <- 50000
+
+# Empty list to store bootstrap coefficients
+bootstrap_coefs_list.treat.CB <- vector("list", length = num_bootstraps.treat.CB)
+
+# Set the seed for reproducibility
+set.seed(123)
+
+# Perform bootstrapping
+for (i in 1:num_bootstraps.treat.CB) {
+  # Sample with replacement from the data
+  sample_indices.treat.CB <- sample(nrow(x.treat.CB), replace = TRUE)
+  x_sampled.treat.CB <- x.treat.CB[sample_indices.treat.CB, ]
+  y_sampled.treat.CB <- y.treat.CB[sample_indices.treat.CB]
+  
+  # Fit the elastic net model on the sampled data
+  model_fit.treat.CB <- glmnet(x_sampled.treat.CB, y_sampled.treat.CB, family = negative.binomial(theta = 1.3020), alpha = 0.87, lambda = lambda.AIC.treat.CB)
+  
+  # Store the coefficients in the list
+  bootstrap_coefs_list.treat.CB[[i]] <- as.vector(coef(model_fit.treat.CB, s = lambda.AIC.treat.CB))
+}
+
+# Convert the list of bootstrap coefficients to a matrix
+bootstrap_coefs.treat.CB <- do.call(rbind, bootstrap_coefs_list.treat.CB)
+
+# Calculate the 95% confidence intervals for each coefficient
+lower_ci.treat.CB <- apply(bootstrap_coefs.treat.CB, 2, function(coef_col) quantile(coef_col, 0.025)) #2.5th percentile
+upper_ci.treat.CB <- apply(bootstrap_coefs.treat.CB, 2, function(coef_col) quantile(coef_col, 0.975)) #97.5th percentile 
+
+# Convert the coefficients to a matrix
+coef_matrix.treat.CB <- as.matrix(coef(elfit.aic.treat.CB, s = lambda.AIC.treat.CB))
+
+# Combine the results into a data frame for easy interpretation
+coef_summary.treat.CB <- data.frame(Coefficient = colnames(coef_matrix.treat.CB),
+                              Estimate = coef_matrix.treat.CB,
+                              Lower.treat.CB = lower_ci.treat.CB,
+                              Upper.treat.CB = upper_ci.treat.CB)
+
+# Print the summary
+print(coef_summary.treat.CB)
+```
+```{r Feature Importance for Burden}
+# Extract the coefficients from the final model
+coef_matrix.treat.CB <- as.matrix(coef(elfit.aic.treat.CB, s = lambda.AIC.treat.CB))
+
+# Get the absolute values of coefficients to identify feature importance
+feature_importance.treat.CB <- abs(coef_matrix.treat.CB[-1,])
+
+# Sort the features by importance (highest to lowest)
+sorted_features.treat.CB <- feature_importance.treat.CB[order(-feature_importance.treat.CB)]
+
+# Get the corresponding feature names
+sorted_feature_names.treat.CB <- colnames(coef_matrix.treat.CB)[-1][order(-feature_importance.treat.CB)]
+
+# Combine the feature names with the sorted feature importance values
+sorted_feature_importance_table.treat.CB <- data.frame(Feature = sorted_feature_names.treat.CB,
+                                                 Importance = sorted_features.treat.CB)
+
+# Print the sorted feature importance table
+print(sorted_feature_importance_table.treat.CB)
+```
+
+#Burden Contrast Comparisons
+
+```{r Using Spores ~ A_Temp * Treatment_F}
+#Model used 
+Treat.CSB <- glm.nb(Spores ~ A_Temp * Timing_Treatment, data = CSC)
+
+# could also try: family = tweedie(var.power = 2)
+EMM.CSB <- emmeans(Treat.CSB , ~ A_Temp * Timing_Treatment, data = CSC)
+EMM.CSB
+```
+```{r Matrices for Contrasts Spores}
+T14.00C.CSB <- c(1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.00C.CSB <- c(0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0) 
+T20.00C.CSB <- c(0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.00C.CSB <- c(0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.33B.CSB <- c(0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.33B.CSB <- c(0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.33B.CSB <- c(0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.33B.CSB <- c(0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.36B.CSB <- c(0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.36B.CSB <- c(0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.36B.CSB <- c(0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.36B.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.63B.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.63B.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.63B.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.63B.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.66B.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0) 
+T17.66B.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.66B.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.66B.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.33D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.33D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.33D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.33D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.36D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.36D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.36D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.36D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.63D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.63D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.63D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.63D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.66D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.66D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.66D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.66D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.33A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.33A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.33A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.33A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.36A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0)
+T17.36A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0)
+T20.36A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0)
+T23.36A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0)
+T14.63A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0)
+T17.63A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0)
+T20.63A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0)
+T23.63A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0)
+T14.66A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0)
+T17.66A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0)
+T20.66A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0)
+T23.66A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1)
+```
+```{r Custom Contrasts Spores}
+contrast(EMM.CSB, adjust = "BH", method = list(
+  "14 +33B v 00C Before"  = T14.33B.CSB - T14.00C.CSB,
+  "14 +36B v 00C Before"  = T14.36B.CSB - T14.00C.CSB,
+  "14 +63B v 00C Before"  = T14.63B.CSB - T14.00C.CSB,
+  "14 +66B v 00C Before"  = T14.66B.CSB - T14.00C.CSB,
+  "14 +36B v +33B Before" = T14.36B.CSB - T14.33B.CSB,
+  "14 +66B v +63B Before" = T14.66B.CSB - T14.63B.CSB,
+  "14 +63B v +33B Before" = T14.63B.CSB - T14.33B.CSB,
+  "14 +66B v +36B Before" = T14.66B.CSB - T14.36B.CSB,
+  
+  "17 +33B v 00C Before"  = T17.33B.CSB - T17.00C.CSB,
+  "17 +36B v 00C Before"  = T17.36B.CSB - T17.00C.CSB,
+  "17 +63B v 00C Before"  = T17.63B.CSB - T17.00C.CSB,
+  "17 +66B v 00C Before"  = T17.66B.CSB - T17.00C.CSB,
+  "17 +36B v +33B Before" = T17.36B.CSB - T17.33B.CSB,
+  "17 +66B v +63B Before" = T17.66B.CSB - T17.63B.CSB,
+  "17 +63B v +33B Before" = T17.63B.CSB - T17.33B.CSB,
+  "17 +66B v +36B Before" = T17.66B.CSB - T17.36B.CSB,
+  
+  "20 +33B v 00C Before"  = T20.33B.CSB - T20.00C.CSB,
+  "20 +36B v 00C Before"  = T20.36B.CSB - T20.00C.CSB,
+  "20 +63B v 00C Before"  = T20.63B.CSB - T20.00C.CSB,
+  "20 +66B v 00C Before"  = T20.66B.CSB - T20.00C.CSB,
+  "20 +36B v +33B Before" = T20.36B.CSB - T20.33B.CSB,
+  "20 +66B v +63B Before" = T20.66B.CSB - T20.63B.CSB,
+  "20 +63B v +33B Before" = T20.63B.CSB - T20.33B.CSB,
+  "20 +66B v +36B Before" = T20.66B.CSB - T20.36B.CSB, 
+  
+  "23 +33B v 00C Before"  = T23.33B.CSB - T23.00C.CSB,
+  "23 +36B v 00C Before"  = T23.36B.CSB - T23.00C.CSB,
+  "23 +63B v 00C Before"  = T23.63B.CSB - T23.00C.CSB,
+  "23 +66B v 00C Before"  = T23.66B.CSB - T23.00C.CSB,
+  "23 +36B v +33B Before" = T23.36B.CSB - T23.33B.CSB,
+  "23 +66B v +63B Before" = T23.66B.CSB - T23.63B.CSB,
+  "23 +63B v +33B Before" = T23.63B.CSB - T23.33B.CSB,
+  "23 +66B v +36B Before" = T23.66B.CSB - T23.36B.CSB,
+  
+  
+  "14 +33D v 00C During"  = T14.33D.CSB - T14.00C.CSB,
+  "14 +36D v 00C During"  = T14.36D.CSB - T14.00C.CSB,
+  "14 +63D v 00C During"  = T14.63D.CSB - T14.00C.CSB,
+  "14 +66D v 00C During"  = T14.66D.CSB - T14.00C.CSB,
+  "14 +36D v +33D During" = T14.36D.CSB - T14.33D.CSB,
+  "14 +66D v +63D During" = T14.66D.CSB - T14.63D.CSB,
+  "14 +63D v +33D During" = T14.63D.CSB - T14.33D.CSB,
+  "14 +66D v +36D During" = T14.66D.CSB - T14.36D.CSB,
+  
+  "17 +33D v 00C During"  = T17.33D.CSB - T17.00C.CSB,
+  "17 +36D v 00C During"  = T17.36D.CSB - T17.00C.CSB,
+  "17 +63D v 00C During"  = T17.63D.CSB - T17.00C.CSB,
+  "17 +66D v 00C During"  = T17.66D.CSB - T17.00C.CSB,
+  "17 +36D v +33D During" = T17.36D.CSB - T17.33D.CSB,
+  "17 +66D v +63D During" = T17.66D.CSB - T17.63D.CSB,
+  "17 +63D v +33D During" = T17.63D.CSB - T17.33D.CSB,
+  "17 +66D v +36D During" = T17.66D.CSB - T17.36D.CSB,
+  
+  "20 +33D v 00C During"  = T20.33D.CSB - T20.00C.CSB,
+  "20 +36D v 00C During"  = T20.36D.CSB - T20.00C.CSB,
+  "20 +63D v 00C During"  = T20.63D.CSB - T20.00C.CSB,
+  "20 +66D v 00C During"  = T20.66D.CSB - T20.00C.CSB,
+  "20 +36D v +33D During" = T20.36D.CSB - T20.33D.CSB,
+  "20 +66D v +63D During" = T20.66D.CSB - T20.63D.CSB,
+  "20 +63D v +33D During" = T20.63D.CSB - T20.33D.CSB,
+  "20 +66D v +36D During" = T20.66D.CSB - T20.36D.CSB, 
+  
+  "23 +33D v 00C During"  = T23.33D.CSB - T23.00C.CSB,
+  "23 +36D v 00C During"  = T23.36D.CSB - T23.00C.CSB,
+  "23 +63D v 00C During"  = T23.63D.CSB - T23.00C.CSB,
+  "23 +66D v 00C During"  = T23.66D.CSB - T23.00C.CSB,
+  "23 +36D v +33D During" = T23.36D.CSB - T23.33D.CSB,
+  "23 +66D v +63D During" = T23.66D.CSB - T23.63D.CSB,
+  "23 +63D v +33D During" = T23.63D.CSB - T23.33D.CSB,
+  "23 +66D v +36D During" = T23.66D.CSB - T23.36D.CSB,
+  
+  "14 +33A v 00C After"  = T14.33A.CSB - T14.00C.CSB,
+  "14 +36A v 00C After"  = T14.36A.CSB - T14.00C.CSB,
+  "14 +63A v 00C After"  = T14.63A.CSB - T14.00C.CSB,
+  "14 +66A v 00C After"  = T14.66A.CSB - T14.00C.CSB,
+  "14 +36A v +33A After" = T14.36A.CSB - T14.33A.CSB,
+  "14 +66A v +63A After" = T14.66A.CSB - T14.63A.CSB,
+  "14 +63A v +33A After" = T14.63A.CSB - T14.33A.CSB,
+  "14 +66A v +36A After" = T14.66A.CSB - T14.36A.CSB,
+  
+  "17 +33A v 00C After"  = T17.33A.CSB - T17.00C.CSB,
+  "17 +36A v 00C After"  = T17.36A.CSB - T17.00C.CSB,
+  "17 +63A v 00C After"  = T17.63A.CSB - T17.00C.CSB,
+  "17 +66A v 00C After"  = T17.66A.CSB - T17.00C.CSB,
+  "17 +36A v +33A After" = T17.36A.CSB - T17.33A.CSB,
+  "17 +66A v +63A After" = T17.66A.CSB - T17.63A.CSB,
+  "17 +63A v +33A After" = T17.63A.CSB - T17.33A.CSB,
+  "17 +66A v +36A After" = T17.66A.CSB - T17.36A.CSB,
+  
+  "20 +33A v 00C After"  = T20.33A.CSB - T20.00C.CSB,
+  "20 +36A v 00C After"  = T20.36A.CSB - T20.00C.CSB,
+  "20 +63A v 00C After"  = T20.63A.CSB - T20.00C.CSB,
+  "20 +66A v 00C After"  = T20.66A.CSB - T20.00C.CSB,
+  "20 +36A v +33A After" = T20.36A.CSB - T20.33A.CSB,
+  "20 +66A v +63A After" = T20.66A.CSB - T20.63A.CSB,
+  "20 +63A v +33A After" = T20.63A.CSB - T20.33A.CSB,
+  "20 +66A v +36A After" = T20.66A.CSB - T20.36A.CSB, 
+  
+  "23 +33A v 00C After"  = T23.33A.CSB - T23.00C.CSB,
+  "23 +36A v 00C After"  = T23.36A.CSB - T23.00C.CSB,
+  "23 +63A v 00C After"  = T23.63A.CSB - T23.00C.CSB,
+  "23 +66A v 00C After"  = T23.66A.CSB - T23.00C.CSB,
+  "23 +36A v +33A After" = T23.36A.CSB - T23.33A.CSB,
+  "23 +66A v +63A After" = T23.66A.CSB - T23.63A.CSB,
+  "23 +63A v +33A After" = T23.63A.CSB - T23.33A.CSB,
+  "23 +66A v +36A After" = T23.66A.CSB - T23.36A.CSB))
+```
+
+#Burden Graphs
+
+```{r Before Burden and Model}
+#making a ggplot plotting by treatment looking at all treatments
+CSB.before.plot <- ggplot(CSB.before, aes(x = A_Temp, y = Spores, colour = Treatment, shape = Treatment, fill = Treatment)) +
+  geom_smooth(aes(x = A_Temp, y = Spores, colour = Treatment), 
+              method = "glm.nb", formula = y ~ poly(x, 3), se = F, linewidth = 0.75, lty = "dashed") +
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(width = 0.6)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax = mean + se.B), width = 0.2, position = position_dodge(width = 0.6)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  guides(color = "none") +
+  theme(axis.text = element_text(size = 17),
+        legend.position = "none") + # Remove the legend
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 1)) +
+  scale_shape_manual(values = c(21, 22, 23, 24, 25)) +  # Use shapes 21-25
+  scale_fill_manual(values = c("#999999", "#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +  # Fill colors matching treatments 
+  scale_colour_manual(values = c("#999999", "#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +  
+  scale_x_continuous(breaks = seq(8, 23, 3)) +
+  coord_cartesian(ylim = c(0,800))
+
+CSB.before.plot
+
+ggsave("CSB.before.plot.png", width = 8.5, height = 6)
+```
+```{r During Burden and Model}
+#making a ggplot plotting by treatment looking at all treatments
+CSB.during.plot <- ggplot(CSB.during, aes(x = A_Temp, y = Spores, colour = Treatment, shape = Treatment, fill = Treatment)) +
+  geom_smooth(aes(x = A_Temp, y = Spores, colour = Treatment), 
+              method = "glm.nb", formula = y ~ poly(x, 3), se = F, linewidth = 0.75, lty = "dashed") +
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(width = 0.6)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax = mean + se.B), width = 0.2, position = position_dodge(width = 0.6)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  guides(color = "none") +
+  theme(axis.text = element_text(size = 17),
+        legend.position = "none") + # Remove the legend
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 1)) +
+  scale_shape_manual(values = c(21, 22, 23, 24, 25)) +  # Use shapes 21-25
+  scale_fill_manual(values = c("#999999", "#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +  # Fill colors matching treatments 
+  scale_colour_manual(values = c("#999999", "#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +
+  scale_x_continuous(breaks = seq(8, 23, 3)) +
+  coord_cartesian(ylim = c(0,800))
+
+CSB.during.plot
+
+ggsave("CSB.during.plot.png", width = 8.5, height = 6)
+
+# old colours = "#BBBBBB", "#94CBEC", "#5DA899", "#337538", "#2E2585"
+```
+```{r After Burden and Model}
+#making a ggplot plotting by treatment looking at all treatments
+CSB.after.plot <- ggplot(CSB.after, aes(x = A_Temp, y = Spores, colour = Treatment, shape = Treatment, fill = Treatment)) +
+  geom_smooth(aes(x = A_Temp, y = Spores, colour = Treatment), 
+              method = "glm.nb", formula = y ~ poly(x, 3), se = F, linewidth = 0.75, lty = "dashed") +
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(width = 0.6)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax = mean + se.B), width = 0.2, position = position_dodge(width = 0.6)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  guides(color = "none") +
+  theme(axis.text = element_text(size = 17),
+        legend.position = "none") + # Remove the legend
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 1)) +
+  scale_shape_manual(values = c(21, 22, 23, 24, 25)) +  # Use shapes 21-25
+  scale_fill_manual(values = c("#999999", "#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +  # Fill colors matching treatments 
+  scale_colour_manual(values = c("#999999", "#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +  
+  scale_x_continuous(breaks = seq(8, 23, 3)) +
+  coord_cartesian(ylim = c(0,800))
+
+CSB.after.plot
+
+ggsave("CSB.after.plot.png", width = 8.5, height = 6)
+
+# old colours = "#BBBBBB", "#94CBEC", "#5DA899", "#337538", "#2E2585"
+```
+
+#Burden Interactions Plots 
+
+Before Amplitude vs Duration
+
+```{r Making Subsets for Interactions (Day -10)}
+Before14.CSB <- subset(CSB.before, A_Temp == "14" & Amplitude %in% c("-3","-6"))
+Before17.CSB <- subset(CSB.before, A_Temp == "17" & Amplitude %in% c("-3","-6")) 
+Before20.CSB <- subset(CSB.before, A_Temp == "20" & Amplitude %in% c("-3","-6"))
+Before23.CSB <- subset(CSB.before, A_Temp == "23" & Amplitude %in% c("-3","-6"))
+```
+
+```{r 14 Degree Amplitude vs Duration (Day -10)}
+Before14.Plot.CSB <- ggplot(Before14.CSB, aes(x = Amplitude, y = Spores, colour = Duration)) +
+  geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = 78, ymax = 118),
+            fill = "#ECECEC", alpha = 0.4, inherit.aes = FALSE) +
+  geom_hline(yintercept = 98, color = "grey", linetype = "dashed") + # Line for constant treatment
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(width = 0.3)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax =  mean + se.B), width = 0.1, position = position_dodge(width = 0.3)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  theme(legend.position = c(0.65, 0.85), 
+        legend.key = element_blank(),  # Removes the box around the legend symbol
+        legend.text = element_text(size = 14), 
+        legend.title = element_text(size = 14)) +
+  scale_colour_manual("CS Duration", values = c("#40B46A","#966AEA"), 
+                      labels = c("3 Days", "6 Days")) +
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+  coord_cartesian(ylim = c(0,800))
+
+Before14.Plot.CSB
+```
+```{r 17 Degree Amplitude vs Duration (Day -10)}
+Before17.Plot.CSB <- ggplot(Before17.CSB, aes(x = Amplitude, y = Spores, colour = Duration)) + 
+  geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = 386, ymax = 468),
+            fill = "#ECECEC", alpha = 0.4, inherit.aes = FALSE) +
+  geom_hline(yintercept = 427, color = "grey", linetype = "dashed") + # Line for constant treatment
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(width = 0.3)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax =  mean + se.B), width = 0.1, position = position_dodge(width = 0.3)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  theme(axis.text = element_text(size = 14)) +
+  guides(color = "none") +
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+  scale_colour_manual(values = c("#009e73","#966AEA")) +
+  coord_cartesian(ylim = c(0,800))
+
+Before17.Plot.CSB
+```
+```{r 20 Degree Amplitude vs Duration (Day -10)}
+Before20.Plot.CSB <- ggplot(Before20.CSB, aes(x = Amplitude, y = Spores, colour = Duration)) +
+  geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = 425, ymax = 547),
+            fill = "#ECECEC", alpha = 0.4, inherit.aes = FALSE) +
+  geom_hline(yintercept = 486, color = "grey", linetype = "dashed") + # Line for constant treatment
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(width = 0.3)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax =  mean + se.B), width = 0.1, position = position_dodge(width = 0.3)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  theme(axis.text = element_text(size = 14)) +
+  guides(color = "none") +
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+  scale_colour_manual(values = c("#009e73","#966AEA")) +
+  coord_cartesian(ylim = c(0,800))
+
+Before20.Plot.CSB
+```
+```{r 23 Degree Amplitude vs Duration (Day -10)}
+Before23.Plot.CSB <- ggplot(Before23.CSB, aes(x = Amplitude, y = Spores, colour = Duration)) +
+  geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = 70, ymax = 120),
+            fill = "#ECECEC", alpha = 0.4, inherit.aes = FALSE) +
+  geom_hline(yintercept = 95, color = "grey", linetype = "dashed") + # Line for constant treatment
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(width = 0.3)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax =  mean + se.B), width = 0.1, position = position_dodge(width = 0.3)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  theme(axis.text = element_text(size = 14)) +
+  scale_y_continuous(position = "right") +
+  guides(color = "none") +
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+  scale_colour_manual(values = c("#009e73","#966AEA")) +
+  coord_cartesian(ylim = c(0,800))
+
+Before23.Plot.CSB
+```
+```{r All Treatments Combination Plot (Day -10)}
+Before.All.CSB <- plot_grid(Before14.Plot.CSB, Before17.Plot.CSB, Before20.Plot.CSB, Before23.Plot.CSB, 
+          ncol = 4, nrow = 1,
+          label_size = 14,
+          label_x = 0.15, label_y = 0.98)
+
+Before.All.CSB
+
+ggsave("Before.All.CSB.png", width = 9, height = 3.5)
+```
+
+During Amplitude vs Duration
+
+```{r Making Subsets for Interactions (Day 0)}
+During14.CSB <- subset(CSB.during, A_Temp == "14" & Amplitude %in% c("-3","-6"))
+During17.CSB <- subset(CSB.during, A_Temp == "17" & Amplitude %in% c("-3","-6")) 
+During20.CSB <- subset(CSB.during, A_Temp == "20" & Amplitude %in% c("-3","-6"))
+During23.CSB <- subset(CSB.during, A_Temp == "23" & Amplitude %in% c("-3","-6"))
+```
+
+```{r 14 Degree Amplitude vs Duration (Day -10)}
+During14.Plot.CSB <- ggplot(During14.CSB, aes(x = Amplitude, y = Spores, colour = Duration)) +
+  geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = 78, ymax = 118),
+            fill = "#ECECEC", alpha = 0.4, inherit.aes = FALSE) +
+  geom_hline(yintercept = 98, color = "grey", linetype = "dashed") + # Line for constant treatment
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(width = 0.3)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax =  mean + se.B), width = 0.1, position = position_dodge(width = 0.3)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  theme(axis.text = element_text(size = 14)) +
+  guides(color = "none") +
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+  scale_colour_manual(values = c("#009e73","#966AEA")) +
+  coord_cartesian(ylim = c(0,800))
+During14.Plot.CSB
+```
+```{r 17 Degree Amplitude vs Duration (Day -10)}
+During17.Plot.CSB <- ggplot(During17.CSB, aes(x = Amplitude, y = Spores, colour = Duration)) + 
+  geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = 386, ymax = 468),
+            fill = "#ECECEC", alpha = 0.4, inherit.aes = FALSE) +
+  geom_hline(yintercept = 427, color = "grey", linetype = "dashed") + # Line for constant treatment
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(width = 0.3)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax =  mean + se.B), width = 0.1, position = position_dodge(width = 0.3)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  theme(axis.text = element_text(size = 14)) +
+  guides(color = "none") +
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+  scale_colour_manual(values = c("#009e73","#966AEA")) +
+  coord_cartesian(ylim = c(0,800))
+
+During17.Plot.CSB
+```
+```{r 20 Degree Amplitude vs Duration (Day -10)}
+During20.Plot.CSB <- ggplot(During20.CSB, aes(x = Amplitude, y = Spores, colour = Duration)) +
+  geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = 425, ymax = 547),
+            fill = "#ECECEC", alpha = 0.4, inherit.aes = FALSE) +
+  geom_hline(yintercept = 486, color = "grey", linetype = "dashed") + # Line for constant treatment
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(width = 0.3)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax =  mean + se.B), width = 0.1, position = position_dodge(width = 0.3)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  theme(axis.text = element_text(size = 14)) +
+  guides(color = "none") +
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+  scale_colour_manual(values = c("#009e73","#966AEA")) +
+  coord_cartesian(ylim = c(0,800))
+
+During20.Plot.CSB
+```
+```{r 23 Degree Amplitude vs Duration (Day -10)}
+During23.Plot.CSB <- ggplot(During23.CSB, aes(x = Amplitude, y = Spores, colour = Duration)) +
+  geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = 70, ymax = 120),
+            fill = "#ECECEC", alpha = 0.4, inherit.aes = FALSE) +
+  geom_hline(yintercept = 95, color = "grey", linetype = "dashed") + # Line for constant treatment
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(width = 0.3)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax =  mean + se.B), width = 0.1, position = position_dodge(width = 0.3)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  theme(axis.text = element_text(size = 14)) +
+  scale_y_continuous(position = "right") +
+  guides(color = "none") +
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+  scale_colour_manual(values = c("#009e73","#966AEA")) +
+  coord_cartesian(ylim = c(0,800))
+
+During23.Plot.CSB
+```
+```{r All Treatments Combination Plot (Day -10)}
+During.All.CSB <- plot_grid(During14.Plot.CSB, During17.Plot.CSB, During20.Plot.CSB, During23.Plot.CSB, 
+          ncol = 4, nrow = 1,
+          label_size = 14,
+          label_x = 0.15, label_y = 0.98)
+
+During.All.CSB
+
+ggsave("During.All.CSB.png", width = 9, height = 3.5)
+```
+
+After Amplitude vs Duration
+
+```{r Making Subsets for Interactions (Day 10)}
+After14.CSB <- subset(CSB.after, A_Temp == "14" & Amplitude %in% c("-3","-6"))
+After17.CSB <- subset(CSB.after, A_Temp == "17" & Amplitude %in% c("-3","-6")) 
+After20.CSB <- subset(CSB.after, A_Temp == "20" & Amplitude %in% c("-3","-6"))
+After23.CSB <- subset(CSB.after, A_Temp == "23" & Amplitude %in% c("-3","-6"))
+```
+
+```{r 14 Degree Amplitude vs Duration (Day 10)}
+After14.Plot.CSB <- ggplot(After14.CSB, aes(x = Amplitude, y = Spores, colour = Duration)) +
+  geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = 78, ymax = 118),
+            fill = "#ECECEC", alpha = 0.4, inherit.aes = FALSE) +
+  geom_hline(yintercept = 98, color = "grey", linetype = "dashed") + # Line for constant treatment
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(width = 0.3)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax =  mean + se.B), width = 0.1, position = position_dodge(width = 0.3)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  theme(axis.text = element_text(size = 14)) +
+  guides(color = "none") +
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+  coord_cartesian(ylim = c(0,800)) +
+  scale_colour_manual(values = c("#009e73","#966AEA"))
+  
+After14.Plot.CSB
+```
+```{r 17 Degree Amplitude vs Duration (Day 10)}
+After17.Plot.CSB <- ggplot(After17.CSB, aes(x = Amplitude, y = Spores, colour = Duration)) + 
+  geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = 386, ymax = 468),
+            fill = "#ECECEC", alpha = 0.4, inherit.aes = FALSE) +
+  geom_hline(yintercept = 427, color = "grey", linetype = "dashed") + # Line for constant treatment
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(width = 0.3)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax =  mean + se.B), width = 0.1, position = position_dodge(width = 0.3)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  theme(axis.text = element_text(size = 14)) +
+  guides(color = "none") +
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+  coord_cartesian(ylim = c(0,800)) +
+  scale_colour_manual(values = c("#009e73","#966AEA"))
+
+After17.Plot.CSB
+```
+```{r 20 Degree Amplitude vs Duration (Day 10)}
+After20.Plot.CSB <- ggplot(After20.CSB, aes(x = Amplitude, y = Spores, colour = Duration)) +
+  geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = 425, ymax = 547),
+            fill = "#ECECEC", alpha = 0.4, inherit.aes = FALSE) +
+  geom_hline(yintercept = 486, color = "grey", linetype = "dashed") + # Line for constant treatment
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(width = 0.3)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax =  mean + se.B), width = 0.1, position = position_dodge(width = 0.3)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  theme(axis.text = element_text(size = 14)) +
+  guides(color = "none") +
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+  coord_cartesian(ylim = c(0,800)) +
+  scale_colour_manual(values = c("#009e73","#966AEA"))
+
+After20.Plot.CSB
+```
+```{r 23 Degree Amplitude vs Duration (Day 10)}
+After23.Plot.CSB <- ggplot(After23.CSB, aes(x = Amplitude, y = Spores, colour = Duration)) +
+  geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = 70, ymax = 120),
+            fill = "#ECECEC", alpha = 0.4, inherit.aes = FALSE) +
+  geom_hline(yintercept = 95, color = "grey", linetype = "dashed") + # Line for constant treatment
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(width = 0.3)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax =  mean + se.B), width = 0.1, position = position_dodge(width = 0.3)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  theme(axis.text = element_text(size = 14)) +
+  scale_y_continuous(position = "right") +
+  guides(color = "none") +
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+  coord_cartesian(ylim = c(0,800)) +
+  scale_colour_manual(values = c("#009e73","#966AEA"))
+
+After23.Plot.CSB
+```
+```{r All Treatments Combination Plot (Day 10)}
+After.All.CSB <- plot_grid(After14.Plot.CSB, After17.Plot.CSB, After20.Plot.CSB, After23.Plot.CSB, 
+          ncol = 4, nrow = 1,
+          label_size = 14,
+          label_x = 0.15, label_y = 0.98)
+
+After.All.CSB
+
+ggsave("After.All.CSB.png", width = 9, height = 3.5)
+```
+
+
+#Burden Degree Day Model
+
+```{r glm.nb for degree day model}
+# STEP 3: Fit a negative binomial GLM with the degree day predictor (11.2°C threshold)
+glmnet_dd_treat_scale.M <- glm.nb(Spores ~ poly(DD_scaled.M, 3) * Timing * Treatment, data = CS.NA)
+summary(glmnet_dd_treat_scale.M)
+```
+```{r Negative Binomial Elastic Regression}
+# Prepare the data
+x.dd.treat.scale.M.CB <- model.matrix(Spores ~ poly(DD_scaled.M, 3) * Timing * Treatment, data = CS.NA)
+
+y.dd.treat.scale.M.CB <- CS.NA$Spores
+```
+```{r Finding optimal alpha}
+#different way to find the most suitable alpha but still involves modelling and finding the lowest AIC out of 1, 0.5, 0
+#theta needs to be manually specified in glmnet so we used the theta present in the GLM 
+cv_lasso.dd.treat.scale.M.CB <- cv.glmnet(x.dd.treat.scale.M.CB, y.dd.treat.scale.M.CB, family = negative.binomial(theta = 1.2627), alpha = 1, maxit = 1e6)
+cv_mix.dd.treat.scale.M.CB   <- cv.glmnet(x.dd.treat.scale.M.CB, y.dd.treat.scale.M.CB, family = negative.binomial(theta = 1.2627), alpha = 0.9, maxit = 1e6)
+cv_ridge.dd.treat.scale.M.CB <- cv.glmnet(x.dd.treat.scale.M.CB, y.dd.treat.scale.M.CB, family = negative.binomial(theta = 1.2627), alpha = 0.8, maxit = 1e6)
+
+# Calculate number of non-zero coefficients for each model
+num_nonzero_lasso.dd.treat.scale.M.CB <- sum(coef(cv_lasso.dd.treat.scale.M.CB, s = 0) != 0)
+num_nonzero_mix.dd.treat.scale.M.CB <- sum(coef(cv_mix.dd.treat.scale.M.CB, s = 0) != 0)
+num_nonzero_ridge.dd.treat.scale.M.CB <- sum(coef(cv_ridge.dd.treat.scale.M.CB, s = 0) != 0)
+
+# Calculate AIC and BIC
+n.dd.treat.scale.M.CB <- length(y.dd.treat.scale.M.CB)
+
+aic_lasso.dd.treat.scale.M.CB <- n.dd.treat.scale.M.CB * log(min(cv_lasso.dd.treat.scale.M.CB$cvm)) + 2 * num_nonzero_lasso.dd.treat.scale.M.CB
+aic_mix.dd.treat.scale.M.CB   <- n.dd.treat.scale.M.CB * log(min(cv_mix.dd.treat.scale.M.CB$cvm)) + 2 * num_nonzero_mix.dd.treat.scale.M.CB
+aic_ridge.dd.treat.scale.M.CB <- n.dd.treat.scale.M.CB * log(min(cv_ridge.dd.treat.scale.M.CB$cvm)) + 2 * num_nonzero_ridge.dd.treat.scale.M.CB
+
+bic_lasso.dd.treat.scale.M.CB <- n.dd.treat.scale.M.CB * log(min(cv_lasso.dd.treat.scale.M.CB$cvm)) + log(n.dd.treat.scale.M.CB) * num_nonzero_lasso.dd.treat.scale.M.CB
+bic_mix.dd.treat.scale.M.CB   <- n.dd.treat.scale.M.CB * log(min(cv_mix.dd.treat.scale.M.CB$cvm)) + log(n.dd.treat.scale.M.CB) * num_nonzero_mix.dd.treat.scale.M.CB
+bic_ridge.dd.treat.scale.M.CB <- n.dd.treat.scale.M.CB * log(min(cv_ridge.dd.treat.scale.M.CB$cvm)) + log(n.dd.treat.scale.M.CB) * num_nonzero_ridge.dd.treat.scale.M.CB
+
+best_alpha_aic.dd.treat.scale.M.CB <- c(1, 0.5, 0)[which.min(c(aic_lasso.dd.treat.scale.M.CB, aic_mix.dd.treat.scale.M.CB, aic_ridge.dd.treat.scale.M.CB))]
+best_alpha_bic.dd.treat.scale.M.CB <- c(1, 0.5, 0)[which.min(c(bic_lasso.dd.treat.scale.M.CB, bic_mix.dd.treat.scale.M.CB, bic_ridge.dd.treat.scale.M.CB))]
+
+data.frame(
+  alpha = c(1, 0.5, 0),
+  AIC = c(aic_lasso.dd.treat.scale.M.CB, aic_mix.dd.treat.scale.M.CB, aic_ridge.dd.treat.scale.M.CB),
+  BIC = c(bic_lasso.dd.treat.scale.M.CB, bic_mix.dd.treat.scale.M.CB, bic_ridge.dd.treat.scale.M.CB)
+)
+```
+```{r Initial Model fit}
+# Fit the elastic net model using the theta from the glm.nb 
+elfit.nb.dd.treat.scale.M.CB <- glmnet(x.dd.treat.scale.M.CB, y.dd.treat.scale.M.CB, family = negative.binomial(theta = 1.2627), alpha = 0.9, maxit = 1e6)
+```
+```{r Finding the optimal lambda}
+# Calculate AIC for each lambda
+aic_values <- sapply(elfit.nb.dd.treat.scale.M.CB$lambda, function(lambda) {
+  fitted_values <- predict(elfit.nb.dd.treat.scale.M.CB, newx = x.dd.treat.scale.M.CB, s = lambda, type = "response")
+  logLikelihood <- sum(dnbinom(y.dd.treat.scale.M.CB, mu = fitted_values, size = 1.2627, log = TRUE))
+  k <- sum(coef(elfit.nb.dd.treat.scale.M.CB, s = lambda, exact = TRUE) != 0)
+  -2 * logLikelihood + 2 * k
+})
+
+# Calculate BIC for each lambda
+n <- length(y.dd.treat.scale.M.CB)
+bic_values <- sapply(elfit.nb.dd.treat.scale.M.CB$lambda, function(lambda) {
+  fitted_values <- predict(elfit.nb.dd.treat.scale.M.CB, newx = x.dd.treat.scale.M.CB, s = lambda, type = "response")
+  logLikelihood <- sum(dnbinom(y.dd.treat.scale.M.CB, mu = fitted_values, size = 1.2627, log = TRUE))
+  k <- sum(coef(elfit.nb.dd.treat.scale.M.CB, s = lambda, exact = TRUE) != 0)
+  -2 * logLikelihood + log(n) * k
+})
+
+# Print AIC and BIC values
+AIC.BIC.dd.treat.scale.M.CB <- data.frame(lambda = elfit.nb.dd.treat.scale.M.CB$lambda, AIC = aic_values, BIC = bic_values)
+```
+```{r Optimal Lambda Elastic Regression}
+lambda.dd.treat.scale.M.CB <- elfit.nb.dd.treat.scale.M.CB$lambda
+#set the lambda as the lowest AIC 
+lambda.AIC.dd.treat.scale.M.CB <- 0.027802494
+
+#final regression with the lowest AIC valued lambda 
+elfit.aic.dd.treat.scale.M.CB <- glmnet(x.dd.treat.scale.M.CB, y.dd.treat.scale.M.CB, family = negative.binomial(theta = 1.2627), alpha = 0.9, lambda = lambda.AIC.dd.treat.scale.M.CB, maxit = 1e6)
+```
+```{r Bootstrap significance testing for burden}
+# Number of bootstrap iterations
+num_bootstraps.dd.treat.scale.M.CB <- 50000
+
+# Empty list to store bootstrap coefficients
+bootstrap_coefs_list.dd.treat.scale.M.CB <- vector("list", length = num_bootstraps.dd.treat.scale.M.CB)
+
+# Set the seed for reproducibility
+set.seed(123)
+
+# Perform bootstrapping
+for (i in 1:num_bootstraps.dd.treat.scale.M.CB) {
+  # Sample with replacement from the data
+  sample_indices.dd.treat.scale.M.CB <- sample(nrow(x.dd.treat.scale.M.CB), replace = TRUE)
+  x_sampled.dd.treat.scale.M.CB <- x.dd.treat.scale.M.CB[sample_indices.dd.treat.scale.M.CB, ]
+  y_sampled.dd.treat.scale.M.CB <- y.dd.treat.scale.M.CB[sample_indices.dd.treat.scale.M.CB]
+  
+  # Fit the elastic net model on the sampled data
+  model_fit.dd.treat.scale.M.CB <- glmnet(x_sampled.dd.treat.scale.M.CB, y_sampled.dd.treat.scale.M.CB, family = negative.binomial(theta = 1.2627), alpha = 0.9, lambda = lambda.AIC.dd.treat.scale.M.CB, maxit = 1e6)
+  
+  # Store the coefficients in the list
+  bootstrap_coefs_list.dd.treat.scale.M.CB[[i]] <- as.vector(coef(model_fit.dd.treat.scale.M.CB, s = lambda.AIC.dd.treat.scale.M.CB))
+}
+
+# Convert the list of bootstrap coefficients to a matrix
+bootstrap_coefs.dd.treat.scale.M.CB <- do.call(rbind, bootstrap_coefs_list.dd.treat.scale.M.CB)
+
+# Calculate the 95% confidence intervals for each coefficient
+lower_ci.dd.treat.scale.M.CB <- apply(bootstrap_coefs.dd.treat.scale.M.CB, 2, function(coef_col) quantile(coef_col, 0.025)) #2.5th percentile
+upper_ci.dd.treat.scale.M.CB <- apply(bootstrap_coefs.dd.treat.scale.M.CB, 2, function(coef_col) quantile(coef_col, 0.975)) #97.5th percentile 
+
+# Convert the coefficients to a matrix
+coef_matrix.dd.treat.scale.M.CB <- as.matrix(coef(elfit.aic.dd.treat.scale.M.CB, s = lambda.AIC.dd.treat.scale.M.CB))
+
+# Combine the results into a data frame for easy interpretation
+coef_summary.dd.treat.scale.M.CB <- data.frame(Coefficient = colnames(coef_matrix.dd.treat.scale.M.CB),
+                              Estimate = coef_matrix.dd.treat.scale.M.CB,
+                              Lower.dd.treat.scale.M.CB = lower_ci.dd.treat.scale.M.CB,
+                              Upper.dd.treat.scale.M.CB = upper_ci.dd.treat.scale.M.CB)
+
+# Print the summary
+print(coef_summary.dd.treat.scale.M.CB)
+```
+
+#Burden Degree Day Graph 
+
+```{r Degree Days Before}
+CSDDB.before.plot <- ggplot() +
+  # Smoothed model fit from full data
+  geom_smooth(data = CSB.before, aes(x = DD_11.2_total, y = Spores, colour = Treatment), 
+              method = "glm.nb", formula = y ~ poly(x, 3), se = FALSE, linewidth = 0.75, lty = "solid") +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  guides(color = "none") +
+  theme(axis.text = element_text(size = 17),
+        legend.position = "none") + # Remove the legend
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 1)) +
+  scale_colour_manual(values = c("#999999", "#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +
+  scale_y_continuous(position = "right") +
+  coord_cartesian(ylim = c(0,800))
+
+CSDDB.before.plot
+
+ggsave("CSDDB.before.plot.png", width = 8.5, height = 6)
+```
+```{r Degree Days During}
+CSDDB.during.plot <- ggplot() +
+  # Smoothed model fit from full data
+  geom_smooth(data = CSB.during, aes(x = DD_11.2_total, y = Spores, colour = Treatment), 
+              method = "glm.nb", formula = y ~ poly(x, 3), se = FALSE, linewidth = 0.75, lty = "solid") +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  guides(color = "none") +
+  theme(axis.text = element_text(size = 17),
+        legend.position = "none") + # Remove the legend
+  scale_y_continuous(position = "right") +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 1)) +
+  scale_colour_manual(values = c("#999999", "#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +
+  coord_cartesian(ylim = c(0,800))
+
+CSDDB.during.plot
+
+ggsave("CSDDB.during.plot.png", width = 8.5, height = 6)
+```
+```{r Degree Days After}
+CSDDB.after.plot <- ggplot() +
+  # Smoothed model fit from full data
+  geom_smooth(data = CSB.after, aes(x = DD_11.2_total, y = Spores, colour = Treatment), 
+              method = "glm.nb", formula = y ~ poly(x, 3), se = FALSE, linewidth = 0.75, lty = "solid") +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  guides(color = "none") +
+  theme(axis.text = element_text(size = 17),
+        legend.position = "none") + # Remove the legend
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 1)) +
+  scale_colour_manual(values = c("#999999", "#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +
+  scale_y_continuous(position = "right") +
+  coord_cartesian(ylim = c(0,800)) 
+
+
+CSDDB.after.plot
+
+ggsave("CSDDB.after.plot.png", width = 8.5, height = 6)
+```

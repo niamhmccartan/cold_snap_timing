@@ -1,0 +1,1443 @@
+---
+title: "CS_Analysis.1"
+output: html_document
+date: "2026-07-01"
+---
+
+#Library Set Up
+
+```{r Library Setup}
+#creating percentages and tidying data
+library(dplyr)
+#mixed model
+library(glmmTMB)
+#anova
+library(car)
+#find the four way interaction
+library(brms)
+#check model fits
+library(DHARMa)
+#post-hoc contrasts for models 
+library(emmeans)
+#GGPlot for graphing
+library(ggplot2)
+```
+
+#Import and Clean Data 
+
+````{r Import Data Set}
+setwd("/Users/niamhmccartan/Documents/College/PhD/Papers/CS_Timing/CS_Timing_R")
+
+coldsnap<-read.csv("CS_Timing.csv", 
+                 header = TRUE, 
+                 stringsAsFactors = FALSE)
+```
+```{r Remove early deaths, males and uninfected controls}
+CS <- subset(coldsnap, Include == "Yes")
+```
+
+```{r Set Variables}
+CS$A_Temp<-as.numeric(CS$A_Temp)
+CS$Real_Avg<-as.numeric(CS$Real_Avg)
+CS$Real_CS<-as.numeric(CS$Real_CS)
+CS$Bath<-as.factor(CS$Bath)
+CS$Timing<-as.factor(CS$Timing)
+CS$Amplitude<-as.factor(CS$Amplitude)
+CS$Duration<-as.factor(CS$Duration)
+CS$Infection<-as.numeric(CS$Infection)
+CS$Spores<-as.numeric(CS$Spores)
+```
+```{r Specifying Order of Factors}
+CS$Timing <- factor(CS$Timing, levels = c("Constant", "Before", "During", "After"))
+CS$Amplitude <- factor(CS$Amplitude, levels = c("0", "-3", "-6"))
+CS$Duration <- factor(CS$Duration, levels = c("0", "3", "6"))
+```
+```{r Make Treatment Column}
+CS$Treatment <- paste(CS$Amplitude, CS$Duration)
+CS$Treatment <- as.factor(CS$Treatment)
+CS$Treatment <- factor(CS$Treatment, levels = c("0 0", "-3 3", "-3 6", "-6 3", "-6 6"))
+```
+```{r Adding Proportion Infected and Standard Error of Burden Column}
+CS = CS %>%
+  group_by(Treatment, A_Temp, Timing) %>% 
+  #Make proportion infected columns 
+  add_count(Treatment) %>% 
+  mutate(
+    nn = sum(Infection != 0),
+    Prop = nn/n,
+  #creating binomial confidence intervals
+  se.I = sqrt(Prop * (1-Prop)/n),
+  lower.I = pmax(Prop - (se.I * 1.96), 0),
+  upper.I = pmin(Prop + (se.I * 1.96), 1)
+  ) %>% 
+  
+  #Make standard error columns
+  mutate(
+    mean = mean(Spores, na.rm = T),
+    sd.B = sd(Spores, na.rm = T),
+    se.B = sd.B/sqrt(n())) %>%
+  ungroup()
+```
+```{r Centre Average Temperature}
+# Centering the 'Real_Avg' variable
+CS$Real_Avg_Cent <- scale(CS$Real_Avg, center = TRUE, scale = TRUE)
+CS$Real_Avg_Cent <- as.numeric(CS$Real_Avg_Cent)
+```
+```{r Make Timing_Treatment column}
+CS$Timing_Treatment <- paste(CS$Timing, CS$Treatment)
+CS$Timing_Treatment <- factor(CS$Timing_Treatment, levels = c("Constant 0 0", 	
+                                                    "Before -3 3", "Before -3 6", "Before -6 3", "Before -6 6",
+                                                    "During -3 3", "During -3 6", "During -6 3", "During -6 6",
+                                                    "After -3 3", "After -3 6", "After -6 3", "After -6 6"))
+```
+```{r Extra Subsets}
+CS$Snap <- ifelse(CS$Treatment == "0 0", "No", "Yes")
+CS$Snap <- factor(CS$Snap, levels = c("No", "Yes"))
+
+#Subset for only core average temperatures
+CSC <- subset(CS, A_Temp %in% c("14","17","20","23"))
+CSC$Real_Avg_Cent <- scale(CSC$Real_Avg, center = TRUE, scale = TRUE)
+CSC$Real_Avg_Cent <- as.numeric(CSC$Real_Avg_Cent)
+CSC$A_Temp <- as.factor(CSC$A_Temp)
+
+CSC_snap <- droplevels(subset(CSC, Snap == "Yes"))
+
+CS.NA <- CS %>% filter(!is.na(Spores))
+
+CSC.NA <- CSC %>% filter(!is.na(Spores))
+CSC_snap.NA <- droplevels(subset(CSC.NA, Snap == "Yes"))
+```
+```{r Timing Subsets Infection}
+#making a subset by each timing and constant controls 
+CSI.before <- subset(CS, Timing %in% c("Before","Constant")) 
+CSI.during <- subset(CS, Timing %in% c("During","Constant"))
+CSI.after <- subset(CS, Timing %in% c("After","Constant"))
+```
+```{r Timing Subsets Burden}
+#making a subset by each timing and constant controls 
+CSB.before <- subset(CS.NA, Timing %in% c("Before","Constant")) 
+CSB.during<- subset(CS.NA, Timing %in% c("During","Constant"))
+CSB.after <- subset(CS.NA, Timing %in% c("After","Constant"))
+```
+
+#Infection Model
+
+```{r Infection model 1 - comparing all treatments and timing}
+# Q1: does a snap happen at all matter, vs constant control?
+presence.CSI <- glmmTMB(Infection ~ poly(Real_Avg_Cent,2) * Timing + (1|Bath),
+                         family = binomial, data = CSC)
+
+summary(presence.CSI)
+
+Anova(presence.CSI, type = "III")
+
+#LRT check
+
+presence.CSI.linear <- glmmTMB(Infection ~ Real_Avg_Cent * Timing + (1|Bath),
+                               family = binomial, data = CSC)
+
+anova(presence.CSI.linear, presence.CSI)
+
+```
+
+```{r Infection Treatment Model exploration}
+# Q2: among snaps that occurred, how do amplitude and duration (now a true 2x2) matter?
+severity.quad.CSI <- glmmTMB(
+  Infection ~ poly(Real_Avg_Cent, 2) * Timing * Amplitude * Duration + (1|Bath),
+      family = binomial, data = CSC_snap,
+      control = glmmTMB::glmmTMBControl(optCtrl = list(iter.max = 1000, eval.max = 1000)))
+summary(severity.quad.CSI)
+severity.CSI <- glmmTMB(Infection ~ Real_Avg_Cent * Timing * Amplitude * Duration + (1|Bath),
+                         family = binomial, data = CSC_snap)
+severity.quad.CSI.reduced <- glmmTMB(
+  Infection ~ poly(Real_Avg_Cent, 2) * (Timing + Amplitude + Duration)
+              + Timing:Amplitude + Timing:Duration + Amplitude:Duration + (1|Bath),
+  family = binomial, data = CSC_snap)
+severity.CSI.reduced <- glmmTMB(
+  Infection ~ Real_Avg_Cent * (Timing + Amplitude + Duration)
+              + Timing:Amplitude + Timing:Duration + Amplitude:Duration + (1|Bath),
+  family = binomial, data = CSC_snap)
+
+anova(severity.quad.CSI.reduced, severity.CSI.reduced, severity.quad.CSI, severity.CSI)  # LRT: is the 4-way interaction justified?
+```
+
+```{r Infection model 2 - to see cold snap treatments}
+severity.CSI <- glmmTMB(
+  Infection ~ poly(Real_Avg_Cent, 2) * (Timing + Amplitude + Duration)
+              + Timing:Amplitude + Timing:Duration + Amplitude:Duration + (1|Bath),
+  family = binomial, data = CSC_snap)
+
+summary(severity.CSI)
+
+Anova(severity.CSI, type = "III")
+```
+
+```{r Infection brms models to find the four way interraction for treatment terms only}
+# Start with the same structure as severity.CSI.reduced as your primary comparison point,
+# then a fuller version with interactions re-added, letting priors handle instability
+
+severity.brm.reduced.CSI <- brm(
+  Infection ~ poly(Real_Avg_Cent, 2) * (Timing + Amplitude + Duration)
+              + Timing:Amplitude + Timing:Duration + Amplitude:Duration
+              + (1 | Bath),
+  family = bernoulli(),
+  data = CSC_snap,
+  prior = c(
+    prior(normal(0, 2.5), class = "b"),        # weakly informative on fixed effects
+    prior(normal(0, 5), class = "Intercept"),
+    prior(exponential(1), class = "sd")        # prior on random-effect SD
+  ),
+  chains = 4, cores = 4, iter = 4000, warmup = 1000,
+  control = list(adapt_delta = 0.999, max_treedepth = 15),
+  seed = 123
+)
+
+# Fuller model, including three-way and four-way interaction terms
+severity.brm.full.CSI <- brm(
+  Infection ~ poly(Real_Avg_Cent, 2) * Timing * Amplitude * Duration
+              + (1 | Bath),
+  family = bernoulli(),
+  data = CSC_snap,
+  prior = c(
+    prior(normal(0, 2.5), class = "b"),
+    prior(normal(0, 5), class = "Intercept"),
+    prior(exponential(1), class = "sd")
+  ),
+  chains = 4, cores = 4, iter = 4000, warmup = 1000,
+  control = list(adapt_delta = 0.999, max_treedepth = 15),
+  seed = 123
+)
+```
+
+```{r Checks for the brms infection models to justify using the reduced model}
+severity.brm.reduced.CSI <- add_criterion(severity.brm.reduced.CSI, "loo")
+severity.brm.full.CSI <- add_criterion(severity.brm.full.CSI, "loo")
+loo_compare(severity.brm.reduced.CSI, severity.brm.full.CSI)
+
+fixef(severity.brm.full.CSI, probs = c(0.05, 0.95))
+#so A Bayesian model with weakly informative priors did sample successfully, but LOO comparison showed no improvement over the reduced (two-way-interaction) model (Δelpd = -1.8, SE = 2.1).
+
+fixef(severity.brm.reduced.CSI, probs = c(0.05, 0.95))
+
+```
+
+```{r DHARMa infection model checks for fits}
+# for each chosen model, simulate residuals and check them
+sim_presence.CI <- simulateResiduals(presence.CSI, n = 1000)
+plot(sim_presence.CI)
+
+sim_severity.CI <- simulateResiduals(severity.CSI, n = 1000)
+plot(sim_severity.CI)
+```
+
+#Infection Contrast Comparisons
+
+```{r create factored model to find treatment outcomes}
+#Model used because glmmTMB didn't converge
+posthoc.CSI <- glm(Infection ~ A_Temp * Timing_Treatment, family = binomial, data = CSC)
+
+# could also try: family = tweedie(var.power = 2)
+emm.CSI <- emmeans(posthoc.CSI , ~ A_Temp * Timing_Treatment, data = CSC)
+emm.CSI
+```
+```{r Matrices for Contrasts Spores}
+T14.00C.CSI <- c(1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.00C.CSI <- c(0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0) 
+T20.00C.CSI <- c(0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.00C.CSI <- c(0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.33B.CSI <- c(0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.33B.CSI <- c(0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.33B.CSI <- c(0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.33B.CSI <- c(0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.36B.CSI <- c(0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.36B.CSI <- c(0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.36B.CSI <- c(0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.36B.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.63B.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.63B.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.63B.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.63B.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.66B.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0) 
+T17.66B.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.66B.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.66B.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.33D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.33D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.33D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.33D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.36D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.36D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.36D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.36D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.63D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.63D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.63D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.63D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.66D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.66D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.66D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.66D.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.33A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.33A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.33A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.33A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.36A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0)
+T17.36A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0)
+T20.36A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0)
+T23.36A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0)
+T14.63A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0)
+T17.63A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0)
+T20.63A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0)
+T23.63A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0)
+T14.66A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0)
+T17.66A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0)
+T20.66A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0)
+T23.66A.CSI <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1)
+```
+```{r Custom Contrasts Spores}
+contrast(emm.CSI, adjust = "BH", method = list(
+  "14 +33B v 00C Before"  = T14.33B.CSI - T14.00C.CSI,
+  "14 +36B v 00C Before"  = T14.36B.CSI - T14.00C.CSI,
+  "14 +63B v 00C Before"  = T14.63B.CSI - T14.00C.CSI,
+  "14 +66B v 00C Before"  = T14.66B.CSI - T14.00C.CSI,
+  "14 +36B v +33B Before" = T14.36B.CSI - T14.33B.CSI,
+  "14 +66B v +63B Before" = T14.66B.CSI - T14.63B.CSI,
+  "14 +63B v +33B Before" = T14.63B.CSI - T14.33B.CSI,
+  "14 +66B v +36B Before" = T14.66B.CSI - T14.36B.CSI,
+  
+  "17 +33B v 00C Before"  = T17.33B.CSI - T17.00C.CSI,
+  "17 +36B v 00C Before"  = T17.36B.CSI - T17.00C.CSI,
+  "17 +63B v 00C Before"  = T17.63B.CSI - T17.00C.CSI,
+  "17 +66B v 00C Before"  = T17.66B.CSI - T17.00C.CSI,
+  "17 +36B v +33B Before" = T17.36B.CSI - T17.33B.CSI,
+  "17 +66B v +63B Before" = T17.66B.CSI - T17.63B.CSI,
+  "17 +63B v +33B Before" = T17.63B.CSI - T17.33B.CSI,
+  "17 +66B v +36B Before" = T17.66B.CSI - T17.36B.CSI,
+  
+  "20 +33B v 00C Before"  = T20.33B.CSI - T20.00C.CSI,
+  "20 +36B v 00C Before"  = T20.36B.CSI - T20.00C.CSI,
+  "20 +63B v 00C Before"  = T20.63B.CSI - T20.00C.CSI,
+  "20 +66B v 00C Before"  = T20.66B.CSI - T20.00C.CSI,
+  "20 +36B v +33B Before" = T20.36B.CSI - T20.33B.CSI,
+  "20 +66B v +63B Before" = T20.66B.CSI - T20.63B.CSI,
+  "20 +63B v +33B Before" = T20.63B.CSI - T20.33B.CSI,
+  "20 +66B v +36B Before" = T20.66B.CSI - T20.36B.CSI, 
+  
+  "23 +33B v 00C Before"  = T23.33B.CSI - T23.00C.CSI,
+  "23 +36B v 00C Before"  = T23.36B.CSI - T23.00C.CSI,
+  "23 +63B v 00C Before"  = T23.63B.CSI - T23.00C.CSI,
+  "23 +66B v 00C Before"  = T23.66B.CSI - T23.00C.CSI,
+  "23 +36B v +33B Before" = T23.36B.CSI - T23.33B.CSI,
+  "23 +66B v +63B Before" = T23.66B.CSI - T23.63B.CSI,
+  "23 +63B v +33B Before" = T23.63B.CSI - T23.33B.CSI,
+  "23 +66B v +36B Before" = T23.66B.CSI - T23.36B.CSI,
+  
+  
+  "14 +33D v 00C During"  = T14.33D.CSI - T14.00C.CSI,
+  "14 +36D v 00C During"  = T14.36D.CSI - T14.00C.CSI,
+  "14 +63D v 00C During"  = T14.63D.CSI - T14.00C.CSI,
+  "14 +66D v 00C During"  = T14.66D.CSI - T14.00C.CSI,
+  "14 +36D v +33D During" = T14.36D.CSI - T14.33D.CSI,
+  "14 +66D v +63D During" = T14.66D.CSI - T14.63D.CSI,
+  "14 +63D v +33D During" = T14.63D.CSI - T14.33D.CSI,
+  "14 +66D v +36D During" = T14.66D.CSI - T14.36D.CSI,
+  
+  "17 +33D v 00C During"  = T17.33D.CSI - T17.00C.CSI,
+  "17 +36D v 00C During"  = T17.36D.CSI - T17.00C.CSI,
+  "17 +63D v 00C During"  = T17.63D.CSI - T17.00C.CSI,
+  "17 +66D v 00C During"  = T17.66D.CSI - T17.00C.CSI,
+  "17 +36D v +33D During" = T17.36D.CSI - T17.33D.CSI,
+  "17 +66D v +63D During" = T17.66D.CSI - T17.63D.CSI,
+  "17 +63D v +33D During" = T17.63D.CSI - T17.33D.CSI,
+  "17 +66D v +36D During" = T17.66D.CSI - T17.36D.CSI,
+  
+  "20 +33D v 00C During"  = T20.33D.CSI - T20.00C.CSI,
+  "20 +36D v 00C During"  = T20.36D.CSI - T20.00C.CSI,
+  "20 +63D v 00C During"  = T20.63D.CSI - T20.00C.CSI,
+  "20 +66D v 00C During"  = T20.66D.CSI - T20.00C.CSI,
+  "20 +36D v +33D During" = T20.36D.CSI - T20.33D.CSI,
+  "20 +66D v +63D During" = T20.66D.CSI - T20.63D.CSI,
+  "20 +63D v +33D During" = T20.63D.CSI - T20.33D.CSI,
+  "20 +66D v +36D During" = T20.66D.CSI - T20.36D.CSI, 
+  
+  "23 +33D v 00C During"  = T23.33D.CSI - T23.00C.CSI,
+  "23 +36D v 00C During"  = T23.36D.CSI - T23.00C.CSI,
+  "23 +63D v 00C During"  = T23.63D.CSI - T23.00C.CSI,
+  "23 +66D v 00C During"  = T23.66D.CSI - T23.00C.CSI,
+  "23 +36D v +33D During" = T23.36D.CSI - T23.33D.CSI,
+  "23 +66D v +63D During" = T23.66D.CSI - T23.63D.CSI,
+  "23 +63D v +33D During" = T23.63D.CSI - T23.33D.CSI,
+  "23 +66D v +36D During" = T23.66D.CSI - T23.36D.CSI,
+  
+  "14 +33A v 00C After"  = T14.33A.CSI - T14.00C.CSI,
+  "14 +36A v 00C After"  = T14.36A.CSI - T14.00C.CSI,
+  "14 +63A v 00C After"  = T14.63A.CSI - T14.00C.CSI,
+  "14 +66A v 00C After"  = T14.66A.CSI - T14.00C.CSI,
+  "14 +36A v +33A After" = T14.36A.CSI - T14.33A.CSI,
+  "14 +66A v +63A After" = T14.66A.CSI - T14.63A.CSI,
+  "14 +63A v +33A After" = T14.63A.CSI - T14.33A.CSI,
+  "14 +66A v +36A After" = T14.66A.CSI - T14.36A.CSI,
+  
+  "17 +33A v 00C After"  = T17.33A.CSI - T17.00C.CSI,
+  "17 +36A v 00C After"  = T17.36A.CSI - T17.00C.CSI,
+  "17 +63A v 00C After"  = T17.63A.CSI - T17.00C.CSI,
+  "17 +66A v 00C After"  = T17.66A.CSI - T17.00C.CSI,
+  "17 +36A v +33A After" = T17.36A.CSI - T17.33A.CSI,
+  "17 +66A v +63A After" = T17.66A.CSI - T17.63A.CSI,
+  "17 +63A v +33A After" = T17.63A.CSI - T17.33A.CSI,
+  "17 +66A v +36A After" = T17.66A.CSI - T17.36A.CSI,
+  
+  "20 +33A v 00C After"  = T20.33A.CSI - T20.00C.CSI,
+  "20 +36A v 00C After"  = T20.36A.CSI - T20.00C.CSI,
+  "20 +63A v 00C After"  = T20.63A.CSI - T20.00C.CSI,
+  "20 +66A v 00C After"  = T20.66A.CSI - T20.00C.CSI,
+  "20 +36A v +33A After" = T20.36A.CSI - T20.33A.CSI,
+  "20 +66A v +63A After" = T20.66A.CSI - T20.63A.CSI,
+  "20 +63A v +33A After" = T20.63A.CSI - T20.33A.CSI,
+  "20 +66A v +36A After" = T20.66A.CSI - T20.36A.CSI, 
+  
+  "23 +33A v 00C After"  = T23.33A.CSI - T23.00C.CSI,
+  "23 +36A v 00C After"  = T23.36A.CSI - T23.00C.CSI,
+  "23 +63A v 00C After"  = T23.63A.CSI - T23.00C.CSI,
+  "23 +66A v 00C After"  = T23.66A.CSI - T23.00C.CSI,
+  "23 +36A v +33A After" = T23.36A.CSI - T23.33A.CSI,
+  "23 +66A v +63A After" = T23.66A.CSI - T23.63A.CSI,
+  "23 +63A v +33A After" = T23.63A.CSI - T23.33A.CSI,
+  "23 +66A v +36A After" = T23.66A.CSI - T23.36A.CSI))
+```
+
+#Infection Graphs Separated
+
+```{r Timing Infection Presence Subsets}
+#make new presence column 
+CS$Presence <- ifelse(CS$Treatment == "0 0", "Constant", "Snap")
+CS$Presence <- factor(CS$Presence, levels = c("Constant", "Snap"))
+
+#get binomial errors
+CS = CS %>%
+  group_by(Presence, A_Temp, Timing) %>%
+  add_count(Presence, name = "n.P") %>%
+  mutate(
+    nn.P = sum(Infection != 0),
+    Prop.P = nn.P/n.P,
+    se.I.P = sqrt(Prop.P * (1-Prop.P)/n.P),
+    lower.I.P = pmax(Prop.P - (se.I.P * 1.96), 0),
+    upper.I.P = pmin(Prop.P + (se.I.P * 1.96), 1)
+  ) %>%
+  ungroup()
+
+#create subgroups
+CSI.pres.before <- subset(CS, Timing %in% c("Before", "Constant"))
+CSI.pres.during <- subset(CS, Timing %in% c("During", "Constant"))
+CSI.pres.after  <- subset(CS, Timing %in% c("After", "Constant"))
+```
+
+```{r Before Infection Presence}
+CSI.pres.before.plot <- ggplot(CSI.pres.before, aes(x = A_Temp, y = Prop.P, colour = Presence, shape = Presence, fill = Presence)) +
+  geom_point(position = position_dodge(width = 0.6), size = 4) +
+  geom_smooth(aes(x = A_Temp, y = Prop.P, colour = Presence, linetype = Presence),
+              method = "glm", method.args = list(family = "binomial"), formula = y ~ poly(x,2),
+              se = FALSE, size = 0.75) +
+  geom_errorbar(aes(ymin = lower.I.P, ymax = upper.I.P), width = 0.2, position = position_dodge(width = 0.6)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  guides(color = "none") +
+  theme(axis.text = element_text(size = 17),
+        legend.position = "none") +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 1)) +
+  scale_shape_manual(values = c(22, 23)) +
+  scale_fill_manual(values = c("#999999", "#3a87c7")) +
+  scale_colour_manual(values = c("#999999", "#3a87c7")) +
+  scale_linetype_manual(values = c("solid", "dashed")) +
+  scale_x_continuous(breaks = seq(8, 23, 3)) +
+  coord_cartesian(ylim = c(0,1))
+
+CSI.pres.before.plot
+
+ggsave("CSI.pres.before.plot.png", width = 8.5, height = 6)
+```
+```{r During Infection Presence}
+CSI.pres.during.plot <- ggplot(CSI.pres.during, aes(x = A_Temp, y = Prop.P, colour = Presence, shape = Presence, fill = Presence)) +
+  geom_point(position = position_dodge(width = 0.6), size = 4) +
+  geom_smooth(aes(x = A_Temp, y = Prop.P, colour = Presence, linetype = Presence),
+              method = "glm", method.args = list(family = "binomial"), formula = y ~ poly(x,2),
+              se = FALSE, size = 0.75) +
+  geom_errorbar(aes(ymin = lower.I.P, ymax = upper.I.P), width = 0.2, position = position_dodge(width = 0.6)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  guides(color = "none") +
+  theme(axis.text = element_text(size = 17),
+        legend.position = "none") +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 1)) +
+  scale_shape_manual(values = c(22, 23)) +
+  scale_fill_manual(values = c("#999999", "#3a87c7")) +
+  scale_colour_manual(values = c("#999999", "#3a87c7")) +
+  scale_linetype_manual(values = c("solid", "dashed")) +
+  scale_x_continuous(breaks = seq(8, 23, 3)) +
+  coord_cartesian(ylim = c(0,1))
+CSI.pres.during.plot
+
+ggsave("CSI.pres.during.plot.png", width = 8.5, height = 6)
+```
+```{r After Infection Presence}
+CSI.pres.after.plot <- ggplot(CSI.pres.after, aes(x = A_Temp, y = Prop.P, colour = Presence, shape = Presence, fill = Presence)) +
+  geom_point(position = position_dodge(width = 0.6), size = 4) +
+  geom_smooth(aes(x = A_Temp, y = Prop.P, colour = Presence, linetype = Presence),
+              method = "glm", method.args = list(family = "binomial"), formula = y ~ poly(x,2),
+              se = FALSE, size = 0.75) +
+  geom_errorbar(aes(ymin = lower.I.P, ymax = upper.I.P), width = 0.2, position = position_dodge(width = 0.6)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  guides(color = "none") +
+  theme(axis.text = element_text(size = 17),
+        legend.position = "none") +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 1)) +
+  scale_shape_manual(values = c(22, 23)) +
+  scale_fill_manual(values = c("#999999", "#3a87c7")) +
+  scale_colour_manual(values = c("#999999", "#3a87c7")) +
+  scale_linetype_manual(values = c("solid", "dashed")) +
+  scale_x_continuous(breaks = seq(8, 23, 3)) +
+  coord_cartesian(ylim = c(0,1))
+CSI.pres.after.plot
+
+ggsave("CSI.pres.after.plot.png", width = 8.5, height = 6)
+```
+
+```{r Timing Infection Severence Subsets}
+#making a subset by each timing and constant controls 
+CSI.sev.before <- subset(CS, Timing %in% c("Before")) 
+CSI.sev.during <- subset(CS, Timing %in% c("During"))
+CSI.sev.after <- subset(CS, Timing %in% c("After"))
+```
+```{r Before Infection Severence}
+CSI.sev.before.plot <- ggplot(CSI.sev.before, aes(x = A_Temp, y = Prop, colour = Treatment, shape = Treatment, fill = Treatment)) +
+  geom_point(position = position_dodge(width = 0.6), size = 4) +
+  geom_smooth(aes(x = A_Temp, y = Prop, colour = Treatment, linetype = Treatment),
+              method = "glm", method.args = list(family = "binomial"), formula = y ~ poly(x,2),
+              se = FALSE, size = 0.75) +
+  geom_errorbar(aes(ymin = lower.I, ymax = upper.I), width = 0.2, position = position_dodge(width = 0.6)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  guides(color = "none") +
+  theme(axis.text = element_text(size = 17),
+        legend.position = "none") +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 1)) +
+  scale_shape_manual(values = c(21, 22, 23, 24, 25)) +
+  scale_fill_manual(values = c("#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +
+  scale_colour_manual(values = c("#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +
+  scale_linetype_manual(values = c("dashed", "dashed", "dashed", "dashed")) +
+  scale_x_continuous(breaks = seq(14, 23, 3)) +
+  scale_y_continuous(position = "right") +
+  coord_cartesian(ylim = c(0,1))
+
+CSI.sev.before.plot
+
+ggsave("CSI.sev.before.plot.png", width = 8.5, height = 6)
+```
+```{r During Infection Severence}
+#making a ggplot plotting by treatment looking at all treatments
+CSI.sev.during.plot <- ggplot(CSI.sev.during, aes(x = A_Temp, y = Prop, colour = Treatment, shape = Treatment, fill = Treatment)) +
+  geom_point(position = position_dodge(width = 0.6), size = 4) +
+  geom_smooth(aes(x = A_Temp, y = Prop, colour = Treatment, linetype = Treatment),
+              method = "glm", method.args = list(family = "binomial"), formula = y ~ poly(x,2),
+              se = FALSE, size = 0.75) +
+  geom_errorbar(aes(ymin = lower.I, ymax = upper.I), width = 0.2, position = position_dodge(width = 0.6)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  guides(color = "none") +
+  theme(axis.text = element_text(size = 17),
+        legend.position = "none") +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 1)) +
+  scale_shape_manual(values = c(21, 22, 23, 24, 25)) +
+  scale_fill_manual(values = c("#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +
+  scale_colour_manual(values = c("#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +
+  scale_linetype_manual(values = c("dashed", "dashed", "dashed", "dashed")) +
+  scale_x_continuous(breaks = seq(14, 23, 3)) +
+  scale_y_continuous(position = "right") +
+  coord_cartesian(ylim = c(0,1))
+
+CSI.sev.during.plot
+
+ggsave("CSI.sev.during.plot.png", width = 8.5, height = 6)
+```
+```{r After Infection Severence}
+#making a ggplot plotting by treatment looking at all treatments
+CSI.sev.after.plot <- ggplot(CSI.sev.after, aes(x = A_Temp, y = Prop, colour = Treatment, shape = Treatment, fill = Treatment)) +
+  geom_point(position = position_dodge(width = 0.6), size = 4) +
+  geom_smooth(aes(x = A_Temp, y = Prop, colour = Treatment, linetype = Treatment),
+              method = "glm", method.args = list(family = "binomial"), formula = y ~ poly(x,2),
+              se = FALSE, size = 0.75) +
+  geom_errorbar(aes(ymin = lower.I, ymax = upper.I), width = 0.2, position = position_dodge(width = 0.6)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  guides(color = "none") +
+  theme(axis.text = element_text(size = 17),
+        legend.position = "none") +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 1)) +
+  scale_shape_manual(values = c(21, 22, 23, 24, 25)) +
+  scale_fill_manual(values = c("#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +
+  scale_colour_manual(values = c("#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +
+  scale_linetype_manual(values = c("dashed", "dashed", "dashed", "dashed")) +
+  scale_x_continuous(breaks = seq(14, 23, 3)) +
+  scale_y_continuous(position = "right") +
+  coord_cartesian(ylim = c(0,1))
+
+CSI.sev.after.plot
+
+ggsave("CSI.sev.after.plot.png", width = 8.5, height = 6)
+```
+
+#Burden Model
+
+```{r Burden model 1 - comparing all treatments and timing}
+presence.CSB <- glmmTMB(Spores ~ poly(Real_Avg_Cent,3) * Timing + (1|Bath),
+                         family = nbinom12, data = CSC.NA)
+
+#double check that cubic is more suitable over quadratic 
+presence.CSB.quad <- glmmTMB(Spores ~ poly(Real_Avg_Cent, 2) * Timing + (1|Bath),
+                              family = nbinom12, data = CSC.NA)
+
+anova(presence.CSB.quad, presence.CSB)  # quadratic vs cubic, nested, valid LRT <- cubic is better 
+
+summary(presence.CSB)
+
+Anova(presence.CSB, type = "III")
+```
+
+```{r Burden model 2 - to see cold snap treatments}
+severity.CSB <- glmmTMB(
+  Spores ~ poly(Real_Avg_Cent, 3) * (Timing + Amplitude + Duration)
+              + Timing:Amplitude + Timing:Duration + Amplitude:Duration + (1|Bath),
+  family = nbinom12(), data = CSC_snap.NA)
+
+#double check that cubic is more suitable over quadratic (it's not)
+severity.CSB.quad <- glmmTMB(
+  Spores ~ poly(Real_Avg_Cent, 2) * (Timing + Amplitude + Duration)
+              + Timing:Amplitude + Timing:Duration + Amplitude:Duration + (1|Bath),
+  family = nbinom12(), data = CSC_snap.NA)
+
+#try running full model - SE for high powered interractions are very high 
+severity.full.CSB <- glmmTMB(
+  Spores ~ poly(Real_Avg_Cent, 3) * Timing * Amplitude * Duration + (1|Bath),
+  family = nbinom12(), data = CSC_snap.NA)
+
+anova(severity.CSB.quad, severity.CSB) # quadratic vs cubic, nested, valid LRT <- cubic is better 
+anova(severity.CSB, severity.full.CSB) # check reduced vs full 
+
+summary(severity.CSB)
+
+Anova(severity.CSB, type = "III")
+```
+
+```{r Burden brms models to find the four way interraction for treatment terms only}
+# Burden brms models: reduced (main effects + two-way) vs full (three/four-way interactions)
+
+severity.brm.reduced.CSB <- brm(
+  Spores ~ poly(Real_Avg_Cent, 3) * (Timing + Amplitude + Duration)
+              + Timing:Amplitude + Timing:Duration + Amplitude:Duration
+              + (1 | Bath),
+  family = negbinomial(),
+  data = CSC_snap.NA,
+  prior = c(
+    prior(normal(0, 2.5), class = "b"),
+    prior(normal(0, 5), class = "Intercept"),
+    prior(exponential(1), class = "sd"),
+    prior(gamma(0.01, 0.01), class = "shape")   # weak prior on NB shape parameter
+  ),
+  chains = 4, cores = 4, iter = 4000, warmup = 1000,
+  control = list(adapt_delta = 0.999, max_treedepth = 15),
+  seed = 123
+)
+
+# Fuller model, including three-way and four-way interaction terms
+severity.brm.full.CSB <- brm(
+  Spores ~ poly(Real_Avg_Cent, 3) * Timing * Amplitude * Duration
+              + (1 | Bath),
+  family = negbinomial(),
+  data = CSC_snap.NA,
+  prior = c(
+    prior(normal(0, 2.5), class = "b"),
+    prior(normal(0, 5), class = "Intercept"),
+    prior(exponential(1), class = "sd"),
+    prior(gamma(0.01, 0.01), class = "shape")
+  ),
+  chains = 4, cores = 4, iter = 4000, warmup = 1000,
+  control = list(adapt_delta = 0.999, max_treedepth = 15),
+  seed = 123
+)
+```
+
+```{r Checks for the brms burden models to justify using the reduced model}
+# Checks for the brms burden models to justify using the reduced model
+severity.brm.reduced.CSB <- add_criterion(severity.brm.reduced.CSB, "loo")
+severity.brm.full.CSB <- add_criterion(
+  severity.brm.full.CSB, "loo",
+  moment_match = TRUE
+)
+loo_compare(severity.brm.reduced.CSB, severity.brm.full.CSB)
+
+fixef(severity.brm.full.CSB, probs = c(0.05, 0.95))
+fixef(severity.brm.reduced.CSB, probs = c(0.05, 0.95))
+```
+
+```{r DHARMa infection model checks for fits}
+sim_presence.CSB <- simulateResiduals(presence.CSB, n = 1000)
+plot(sim_presence.CSB)
+
+sim_severity.CSB <- simulateResiduals(severity.CSB, n = 1000)
+plot(sim_severity.CSB)
+```
+
+```{r Check DHARMa residuals}
+plotResiduals(sim_presence.CSB, form = CSC.NA$Real_Avg_Cent)  
+
+plotResiduals(sim_severity.CSB, form = CSC_snap.NA$Real_Avg_Cent)  
+```
+
+```{r Burden model - chosen after DHARMa checks}
+presence.disp.CSB <- glmmTMB(
+  Spores ~ poly(Real_Avg_Cent, 3) * Timing + (1|Bath),
+  dispformula = ~ poly(Real_Avg_Cent, 3),
+  family = nbinom12,
+  data = CSC.NA
+)
+
+# re-run diagnostics
+sim_presence.disp.CSB <- simulateResiduals(presence.disp.CSB, n = 1000)
+
+plotResiduals(sim_presence.disp.CSB, form = presence.disp.CSB$frame$Real_Avg_Cent)
+
+summary(presence.disp.CSB)
+
+Anova(presence.disp.CSB, type = "III")
+```
+
+#Burden Contrast Comparisons
+
+```{r Using Spores ~ A_Temp * Treatment_F}
+#Model used 
+Treat.CSB <- glm.nb(Spores ~ A_Temp * Timing_Treatment, data = CSC.NA)
+
+# could also try: family = tweedie(var.power = 2)
+EMM.CSB <- emmeans(Treat.CSB , ~ A_Temp * Timing_Treatment, data = CSC.NA)
+EMM.CSB
+```
+```{r Matrices for Contrasts Spores}
+T14.00C.CSB <- c(1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.00C.CSB <- c(0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0) 
+T20.00C.CSB <- c(0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.00C.CSB <- c(0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.33B.CSB <- c(0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.33B.CSB <- c(0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.33B.CSB <- c(0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.33B.CSB <- c(0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.36B.CSB <- c(0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.36B.CSB <- c(0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.36B.CSB <- c(0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.36B.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.63B.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.63B.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.63B.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.63B.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.66B.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0) 
+T17.66B.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.66B.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.66B.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.33D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.33D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.33D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.33D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.36D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.36D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.36D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.36D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.63D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.63D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.63D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.63D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.66D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.66D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.66D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.66D.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.33A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T17.33A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T20.33A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0)
+T23.33A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0)
+T14.36A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0)
+T17.36A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0)
+T20.36A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0)
+T23.36A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0)
+T14.63A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0)
+T17.63A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0)
+T20.63A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0)
+T23.63A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0)
+T14.66A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0)
+T17.66A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0)
+T20.66A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0)
+T23.66A.CSB <- c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1)
+```
+```{r Custom Contrasts Spores}
+contrast(EMM.CSB, adjust = "BH", method = list(
+  "14 -33B v 00C Before"  = T14.33B.CSB - T14.00C.CSB,
+  "14 -36B v 00C Before"  = T14.36B.CSB - T14.00C.CSB,
+  "14 -63B v 00C Before"  = T14.63B.CSB - T14.00C.CSB,
+  "14 -66B v 00C Before"  = T14.66B.CSB - T14.00C.CSB,
+  "14 -36B v -33B Before" = T14.36B.CSB - T14.33B.CSB,
+  "14 -66B v -63B Before" = T14.66B.CSB - T14.63B.CSB,
+  "14 -63B v -33B Before" = T14.63B.CSB - T14.33B.CSB,
+  "14 -66B v -36B Before" = T14.66B.CSB - T14.36B.CSB,
+  
+  "17 -33B v 00C Before"  = T17.33B.CSB - T17.00C.CSB,
+  "17 -36B v 00C Before"  = T17.36B.CSB - T17.00C.CSB,
+  "17 -63B v 00C Before"  = T17.63B.CSB - T17.00C.CSB,
+  "17 -66B v 00C Before"  = T17.66B.CSB - T17.00C.CSB,
+  "17 -36B v -33B Before" = T17.36B.CSB - T17.33B.CSB,
+  "17 -66B v -63B Before" = T17.66B.CSB - T17.63B.CSB,
+  "17 -63B v -33B Before" = T17.63B.CSB - T17.33B.CSB,
+  "17 -66B v -36B Before" = T17.66B.CSB - T17.36B.CSB,
+  
+  "20 -33B v 00C Before"  = T20.33B.CSB - T20.00C.CSB,
+  "20 -36B v 00C Before"  = T20.36B.CSB - T20.00C.CSB,
+  "20 -63B v 00C Before"  = T20.63B.CSB - T20.00C.CSB,
+  "20 -66B v 00C Before"  = T20.66B.CSB - T20.00C.CSB,
+  "20 -36B v -33B Before" = T20.36B.CSB - T20.33B.CSB,
+  "20 -66B v -63B Before" = T20.66B.CSB - T20.63B.CSB,
+  "20 -63B v -33B Before" = T20.63B.CSB - T20.33B.CSB,
+  "20 -66B v -36B Before" = T20.66B.CSB - T20.36B.CSB, 
+  
+  "23 -33B v 00C Before"  = T23.33B.CSB - T23.00C.CSB,
+  "23 -36B v 00C Before"  = T23.36B.CSB - T23.00C.CSB,
+  "23 -63B v 00C Before"  = T23.63B.CSB - T23.00C.CSB,
+  "23 -66B v 00C Before"  = T23.66B.CSB - T23.00C.CSB,
+  "23 -36B v -33B Before" = T23.36B.CSB - T23.33B.CSB,
+  "23 -66B v -63B Before" = T23.66B.CSB - T23.63B.CSB,
+  "23 -63B v -33B Before" = T23.63B.CSB - T23.33B.CSB,
+  "23 -66B v -36B Before" = T23.66B.CSB - T23.36B.CSB,
+  
+  
+  "14 -33D v 00C During"  = T14.33D.CSB - T14.00C.CSB,
+  "14 -36D v 00C During"  = T14.36D.CSB - T14.00C.CSB,
+  "14 -63D v 00C During"  = T14.63D.CSB - T14.00C.CSB,
+  "14 -66D v 00C During"  = T14.66D.CSB - T14.00C.CSB,
+  "14 -36D v -33D During" = T14.36D.CSB - T14.33D.CSB,
+  "14 -66D v -63D During" = T14.66D.CSB - T14.63D.CSB,
+  "14 -63D v -33D During" = T14.63D.CSB - T14.33D.CSB,
+  "14 -66D v -36D During" = T14.66D.CSB - T14.36D.CSB,
+  
+  "17 -33D v 00C During"  = T17.33D.CSB - T17.00C.CSB,
+  "17 -36D v 00C During"  = T17.36D.CSB - T17.00C.CSB,
+  "17 -63D v 00C During"  = T17.63D.CSB - T17.00C.CSB,
+  "17 -66D v 00C During"  = T17.66D.CSB - T17.00C.CSB,
+  "17 -36D v -33D During" = T17.36D.CSB - T17.33D.CSB,
+  "17 -66D v -63D During" = T17.66D.CSB - T17.63D.CSB,
+  "17 -63D v -33D During" = T17.63D.CSB - T17.33D.CSB,
+  "17 -66D v -36D During" = T17.66D.CSB - T17.36D.CSB,
+  
+  "20 -33D v 00C During"  = T20.33D.CSB - T20.00C.CSB,
+  "20 -36D v 00C During"  = T20.36D.CSB - T20.00C.CSB,
+  "20 -63D v 00C During"  = T20.63D.CSB - T20.00C.CSB,
+  "20 -66D v 00C During"  = T20.66D.CSB - T20.00C.CSB,
+  "20 -36D v -33D During" = T20.36D.CSB - T20.33D.CSB,
+  "20 -66D v -63D During" = T20.66D.CSB - T20.63D.CSB,
+  "20 -63D v -33D During" = T20.63D.CSB - T20.33D.CSB,
+  "20 -66D v -36D During" = T20.66D.CSB - T20.36D.CSB, 
+  
+  "23 -33D v 00C During"  = T23.33D.CSB - T23.00C.CSB,
+  "23 -36D v 00C During"  = T23.36D.CSB - T23.00C.CSB,
+  "23 -63D v 00C During"  = T23.63D.CSB - T23.00C.CSB,
+  "23 -66D v 00C During"  = T23.66D.CSB - T23.00C.CSB,
+  "23 -36D v -33D During" = T23.36D.CSB - T23.33D.CSB,
+  "23 -66D v -63D During" = T23.66D.CSB - T23.63D.CSB,
+  "23 -63D v -33D During" = T23.63D.CSB - T23.33D.CSB,
+  "23 -66D v -36D During" = T23.66D.CSB - T23.36D.CSB,
+  
+  "14 -33A v 00C After"  = T14.33A.CSB - T14.00C.CSB,
+  "14 -36A v 00C After"  = T14.36A.CSB - T14.00C.CSB,
+  "14 -63A v 00C After"  = T14.63A.CSB - T14.00C.CSB,
+  "14 -66A v 00C After"  = T14.66A.CSB - T14.00C.CSB,
+  "14 -36A v -33A After" = T14.36A.CSB - T14.33A.CSB,
+  "14 -66A v -63A After" = T14.66A.CSB - T14.63A.CSB,
+  "14 -63A v -33A After" = T14.63A.CSB - T14.33A.CSB,
+  "14 -66A v -36A After" = T14.66A.CSB - T14.36A.CSB,
+  
+  "17 -33A v 00C After"  = T17.33A.CSB - T17.00C.CSB,
+  "17 -36A v 00C After"  = T17.36A.CSB - T17.00C.CSB,
+  "17 -63A v 00C After"  = T17.63A.CSB - T17.00C.CSB,
+  "17 -66A v 00C After"  = T17.66A.CSB - T17.00C.CSB,
+  "17 -36A v -33A After" = T17.36A.CSB - T17.33A.CSB,
+  "17 -66A v -63A After" = T17.66A.CSB - T17.63A.CSB,
+  "17 -63A v -33A After" = T17.63A.CSB - T17.33A.CSB,
+  "17 -66A v -36A After" = T17.66A.CSB - T17.36A.CSB,
+  
+  "20 -33A v 00C After"  = T20.33A.CSB - T20.00C.CSB,
+  "20 -36A v 00C After"  = T20.36A.CSB - T20.00C.CSB,
+  "20 -63A v 00C After"  = T20.63A.CSB - T20.00C.CSB,
+  "20 -66A v 00C After"  = T20.66A.CSB - T20.00C.CSB,
+  "20 -36A v -33A After" = T20.36A.CSB - T20.33A.CSB,
+  "20 -66A v -63A After" = T20.66A.CSB - T20.63A.CSB,
+  "20 -63A v -33A After" = T20.63A.CSB - T20.33A.CSB,
+  "20 -66A v -36A After" = T20.66A.CSB - T20.36A.CSB, 
+  
+  "23 -33A v 00C After"  = T23.33A.CSB - T23.00C.CSB,
+  "23 -36A v 00C After"  = T23.36A.CSB - T23.00C.CSB,
+  "23 -63A v 00C After"  = T23.63A.CSB - T23.00C.CSB,
+  "23 -66A v 00C After"  = T23.66A.CSB - T23.00C.CSB,
+  "23 -36A v -33A After" = T23.36A.CSB - T23.33A.CSB,
+  "23 -66A v -63A After" = T23.66A.CSB - T23.63A.CSB,
+  "23 -63A v -33A After" = T23.63A.CSB - T23.33A.CSB,
+  "23 -66A v -36A After" = T23.66A.CSB - T23.36A.CSB))
+```
+
+#Burden Graphs Separated
+```{r Timing Burden Presence Subsets}
+CS.NA = CS.NA %>%
+  group_by(Presence, A_Temp, Timing) %>%
+  mutate(
+    mean.P.B = mean(Spores, na.rm = TRUE),
+    sd.B.P = sd(Spores, na.rm = TRUE),
+    se.B.P = sd.B.P/sqrt(sum(!is.na(Spores)))
+  ) %>%
+  ungroup()
+
+CSB.pres.before <- subset(CS.NA, Timing %in% c("Before", "Constant"))
+CSB.pres.during <- subset(CS.NA, Timing %in% c("During", "Constant"))
+CSB.pres.after  <- subset(CS.NA, Timing %in% c("After", "Constant"))
+```
+
+```{r Before Burden Presence}
+CSB.pres.before.plot <- ggplot(CSB.pres.before, aes(x = A_Temp, y = Spores, colour = Presence, shape = Presence, fill = Presence)) +
+  geom_smooth(aes(x = A_Temp, y = Spores, colour = Presence, linetype = Presence),
+              method = "glm.nb", formula = y ~ poly(x, 3), se = FALSE, size = 0.75) +
+  stat_summary(aes(y = mean.P.B), fun = "mean", geom = "point", size = 4, position = position_dodge(width = 0.6)) +
+  geom_errorbar(aes(ymin = mean.P.B - se.B.P, ymax = mean.P.B + se.B.P), width = 0.2, position = position_dodge(width = 0.6)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  theme(axis.text = element_text(size = 17),
+        legend.position = "top",
+        legend.title = element_blank(),
+        legend.text = element_text(size = 16)) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 1)) +
+  scale_shape_manual(values = c(22, 23), labels = c("Constant", "Cold Snap")) +
+  scale_fill_manual(values = c("#999999", "#3a87c7"), labels = c("Constant", "Cold Snap")) +
+  scale_colour_manual(values = c("#999999", "#3a87c7"), labels = c("Constant", "Cold Snap")) +
+  scale_linetype_manual(values = c("solid", "dashed"), labels = c("Constant", "Cold Snap")) +
+  scale_x_continuous(breaks = seq(8, 23, 3)) +
+  coord_cartesian(ylim = c(0,800))
+
+CSB.pres.before.plot
+
+ggsave("CSB.pres.before.plot.png", width = 8.5, height = 6)
+```
+
+```{r During Burden Presence}
+CSB.pres.during.plot <- ggplot(CSB.pres.during, aes(x = A_Temp, y = Spores, colour = Presence, shape = Presence, fill = Presence)) +
+  geom_smooth(aes(x = A_Temp, y = Spores, colour = Presence, linetype = Presence),
+              method = "glm.nb", formula = y ~ poly(x, 3), se = FALSE, size = 0.75) +
+  stat_summary(aes(y = mean.P.B), fun = "mean", geom = "point", size = 4, position = position_dodge(width = 0.6)) +
+  geom_errorbar(aes(ymin = mean.P.B - se.B.P, ymax = mean.P.B + se.B.P), width = 0.2, position = position_dodge(width = 0.6)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  guides(color = "none") +
+  theme(axis.text = element_text(size = 17),
+        legend.position = "none") +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 1)) +
+  scale_shape_manual(values = c(22, 23)) +
+  scale_fill_manual(values = c("#999999", "#3a87c7")) +
+  scale_colour_manual(values = c("#999999", "#3a87c7")) +
+  scale_linetype_manual(values = c("solid", "dashed")) +
+  scale_x_continuous(breaks = seq(8, 23, 3)) +
+  coord_cartesian(ylim = c(0,800))
+
+CSB.pres.during.plot
+
+ggsave("CSB.pres.during.plot.png", width = 8.5, height = 6)
+```
+```{r After Burden Presence}
+CSB.pres.after.plot <- ggplot(CSB.pres.after, aes(x = A_Temp, y = Spores, colour = Presence, shape = Presence, fill = Presence)) +
+  geom_smooth(aes(x = A_Temp, y = Spores, colour = Presence, linetype = Presence),
+              method = "glm.nb", formula = y ~ poly(x, 3), se = FALSE, size = 0.75) +
+  stat_summary(aes(y = mean.P.B), fun = "mean", geom = "point", size = 4, position = position_dodge(width = 0.6)) +
+  geom_errorbar(aes(ymin = mean.P.B - se.B.P, ymax = mean.P.B + se.B.P), width = 0.2, position = position_dodge(width = 0.6)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  guides(color = "none") +
+  theme(axis.text = element_text(size = 17),
+        legend.position = "none") +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 1)) +
+  scale_shape_manual(values = c(22, 23)) +
+  scale_fill_manual(values = c("#999999", "#3a87c7")) +
+  scale_colour_manual(values = c("#999999", "#3a87c7")) +
+  scale_linetype_manual(values = c("solid", "dashed")) +
+  scale_x_continuous(breaks = seq(8, 23, 3)) +
+  coord_cartesian(ylim = c(0,800))
+
+CSB.pres.after.plot
+
+ggsave("CSB.pres.after.plot.png", width = 8.5, height = 6)
+```
+
+
+```{r Timing Burden Severence Subsets}
+CSB.sev.before <- subset(CS.NA, Timing %in% c("Before")) 
+CSB.sev.during<- subset(CS.NA, Timing %in% c("During"))
+CSB.sev.after <- subset(CS.NA, Timing %in% c("After"))
+```
+
+```{r Before Burden Severence}
+#making a ggplot plotting by treatment looking at all treatments
+CSB.sev.before.plot <- ggplot(CSB.sev.before, aes(x = A_Temp, y = Spores, colour = Treatment, shape = Treatment, fill = Treatment)) +
+  geom_smooth(aes(x = A_Temp, y = Spores, colour = Treatment, linetype = Treatment), 
+              method = "glm.nb", formula = y ~ poly(x, 3), se = FALSE, size = 0.75) +
+  stat_summary(fun = "mean", geom = "point", size = 4, position = position_dodge(width = 0.6)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax = mean + se.B), width = 0.2, position = position_dodge(width = 0.6)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  guides(color = "none") +
+  theme(axis.text = element_text(size = 17),
+        legend.position = "none") + # Remove the legend
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 1)) +
+  scale_shape_manual(values = c(22, 23, 24, 25)) +
+  scale_fill_manual(values = c("#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +
+  scale_colour_manual(values = c("#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +
+  scale_linetype_manual(values = c("dashed", "dashed", "dashed", "dashed")) +
+  scale_x_continuous(breaks = seq(14, 23, 3)) +
+  scale_y_continuous(position = "right") +
+  coord_cartesian(ylim = c(0,800))
+
+CSB.sev.before.plot
+
+ggsave("CSB.sev.before.plot.png", width = 8.5, height = 6)
+```
+```{r During Burden Severence}
+#making a ggplot plotting by treatment looking at all treatments
+CSB.sev.during.plot <- ggplot(CSB.sev.during, aes(x = A_Temp, y = Spores, colour = Treatment, shape = Treatment, fill = Treatment)) +
+  geom_smooth(aes(x = A_Temp, y = Spores, colour = Treatment, linetype = Treatment), 
+              method = "glm.nb", formula = y ~ poly(x, 3), se = FALSE, size = 0.75) +
+  stat_summary(fun = "mean", geom = "point", size = 4, position = position_dodge(width = 0.6)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax = mean + se.B), width = 0.2, position = position_dodge(width = 0.6)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  guides(color = "none") +
+  theme(axis.text = element_text(size = 17),
+        legend.position = "none") + # Remove the legend
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 1)) +
+  scale_shape_manual(values = c(22, 23, 24, 25)) +
+  scale_fill_manual(values = c("#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +
+  scale_colour_manual(values = c("#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +
+  scale_linetype_manual(values = c("dashed", "dashed", "dashed", "dashed")) +
+  scale_x_continuous(breaks = seq(14, 23, 3)) +
+  scale_y_continuous(position = "right") +
+  coord_cartesian(ylim = c(0,800))
+
+CSB.sev.during.plot
+
+ggsave("CSB.sev.during.plot.png", width = 8.5, height = 6)
+
+# old colours = "#BBBBBB", "#94CBEC", "#5DA899", "#337538", "#2E2585"
+```
+```{r After Burden Severence}
+#making a ggplot plotting by treatment looking at all treatments
+CSB.sev.after.plot <- ggplot(CSB.sev.after, aes(x = A_Temp, y = Spores, colour = Treatment, shape = Treatment, fill = Treatment)) +
+  geom_smooth(aes(x = A_Temp, y = Spores, colour = Treatment, linetype = Treatment), 
+              method = "glm.nb", formula = y ~ poly(x, 3), se = FALSE, size = 0.75) +
+  stat_summary(fun = "mean", geom = "point", size = 4, position = position_dodge(width = 0.6)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax = mean + se.B), width = 0.2, position = position_dodge(width = 0.6)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  guides(color = "none") +
+  theme(axis.text = element_text(size = 17),
+        legend.position = "none") + # Remove the legend
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 1)) +
+  scale_shape_manual(values = c(22, 23, 24, 25)) +
+  scale_fill_manual(values = c("#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +
+  scale_colour_manual(values = c("#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +
+  scale_linetype_manual(values = c("dashed", "dashed", "dashed", "dashed")) +
+  scale_x_continuous(breaks = seq(14, 23, 3)) +
+  scale_y_continuous(position = "right") +
+  coord_cartesian(ylim = c(0,800))
+
+CSB.sev.after.plot
+
+ggsave("CSB.sev.after.plot.png", width = 8.5, height = 6)
+```
+
+
+#Burden Interactions Plots 
+
+Before Amplitude vs Duration
+
+```{r Making Subsets for Interactions (Day -10)}
+Before14.CSB <- subset(CSB.before, A_Temp == "14" & Amplitude %in% c("-3","-6"))
+Before17.CSB <- subset(CSB.before, A_Temp == "17" & Amplitude %in% c("-3","-6")) 
+Before20.CSB <- subset(CSB.before, A_Temp == "20" & Amplitude %in% c("-3","-6"))
+Before23.CSB <- subset(CSB.before, A_Temp == "23" & Amplitude %in% c("-3","-6"))
+```
+
+```{r 14 Degree Amplitude vs Duration (Day -10)}
+Before14.Plot.CSB <- ggplot(Before14.CSB, aes(x = Amplitude, y = Spores, colour = Duration)) +
+  geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = 78, ymax = 118),
+            fill = "#ECECEC", alpha = 0.4, inherit.aes = FALSE) +
+  geom_hline(yintercept = 98, color = "grey", linetype = "dashed") + # Line for constant treatment
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(width = 0.3)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax =  mean + se.B), width = 0.1, position = position_dodge(width = 0.3)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  theme(legend.position = c(0.65, 0.85), 
+        legend.key = element_blank(),  # Removes the box around the legend symbol
+        legend.text = element_text(size = 14), 
+        legend.title = element_text(size = 14)) +
+  scale_colour_manual("CS Duration", values = c("#40B46A","#966AEA"), 
+                      labels = c("3 Days", "6 Days")) +
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+  coord_cartesian(ylim = c(0,800))
+
+Before14.Plot.CSB
+```
+```{r 17 Degree Amplitude vs Duration (Day -10)}
+Before17.Plot.CSB <- ggplot(Before17.CSB, aes(x = Amplitude, y = Spores, colour = Duration)) + 
+  geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = 386, ymax = 468),
+            fill = "#ECECEC", alpha = 0.4, inherit.aes = FALSE) +
+  geom_hline(yintercept = 427, color = "grey", linetype = "dashed") + # Line for constant treatment
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(width = 0.3)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax =  mean + se.B), width = 0.1, position = position_dodge(width = 0.3)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  theme(axis.text = element_text(size = 14)) +
+  guides(color = "none") +
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+  scale_colour_manual(values = c("#009e73","#966AEA")) +
+  coord_cartesian(ylim = c(0,800))
+
+Before17.Plot.CSB
+```
+```{r 20 Degree Amplitude vs Duration (Day -10)}
+Before20.Plot.CSB <- ggplot(Before20.CSB, aes(x = Amplitude, y = Spores, colour = Duration)) +
+  geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = 425, ymax = 547),
+            fill = "#ECECEC", alpha = 0.4, inherit.aes = FALSE) +
+  geom_hline(yintercept = 486, color = "grey", linetype = "dashed") + # Line for constant treatment
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(width = 0.3)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax =  mean + se.B), width = 0.1, position = position_dodge(width = 0.3)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  theme(axis.text = element_text(size = 14)) +
+  guides(color = "none") +
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+  scale_colour_manual(values = c("#009e73","#966AEA")) +
+  coord_cartesian(ylim = c(0,800))
+
+Before20.Plot.CSB
+```
+```{r 23 Degree Amplitude vs Duration (Day -10)}
+Before23.Plot.CSB <- ggplot(Before23.CSB, aes(x = Amplitude, y = Spores, colour = Duration)) +
+  geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = 70, ymax = 120),
+            fill = "#ECECEC", alpha = 0.4, inherit.aes = FALSE) +
+  geom_hline(yintercept = 95, color = "grey", linetype = "dashed") + # Line for constant treatment
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(width = 0.3)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax =  mean + se.B), width = 0.1, position = position_dodge(width = 0.3)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  theme(axis.text = element_text(size = 14)) +
+  scale_y_continuous(position = "right") +
+  guides(color = "none") +
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+  scale_colour_manual(values = c("#009e73","#966AEA")) +
+  coord_cartesian(ylim = c(0,800))
+
+Before23.Plot.CSB
+```
+```{r All Treatments Combination Plot (Day -10)}
+Before.All.CSB <- plot_grid(Before14.Plot.CSB, Before17.Plot.CSB, Before20.Plot.CSB, Before23.Plot.CSB, 
+          ncol = 4, nrow = 1,
+          label_size = 14,
+          label_x = 0.15, label_y = 0.98)
+
+Before.All.CSB
+
+ggsave("Before.All.CSB.png", width = 9, height = 3.5)
+```
+
+During Amplitude vs Duration
+
+```{r Making Subsets for Interactions (Day 0)}
+During14.CSB <- subset(CSB.during, A_Temp == "14" & Amplitude %in% c("-3","-6"))
+During17.CSB <- subset(CSB.during, A_Temp == "17" & Amplitude %in% c("-3","-6")) 
+During20.CSB <- subset(CSB.during, A_Temp == "20" & Amplitude %in% c("-3","-6"))
+During23.CSB <- subset(CSB.during, A_Temp == "23" & Amplitude %in% c("-3","-6"))
+```
+
+```{r 14 Degree Amplitude vs Duration (Day -10)}
+During14.Plot.CSB <- ggplot(During14.CSB, aes(x = Amplitude, y = Spores, colour = Duration)) +
+  geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = 78, ymax = 118),
+            fill = "#ECECEC", alpha = 0.4, inherit.aes = FALSE) +
+  geom_hline(yintercept = 98, color = "grey", linetype = "dashed") + # Line for constant treatment
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(width = 0.3)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax =  mean + se.B), width = 0.1, position = position_dodge(width = 0.3)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  theme(axis.text = element_text(size = 14)) +
+  guides(color = "none") +
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+  scale_colour_manual(values = c("#009e73","#966AEA")) +
+  coord_cartesian(ylim = c(0,800))
+During14.Plot.CSB
+```
+```{r 17 Degree Amplitude vs Duration (Day -10)}
+During17.Plot.CSB <- ggplot(During17.CSB, aes(x = Amplitude, y = Spores, colour = Duration)) + 
+  geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = 386, ymax = 468),
+            fill = "#ECECEC", alpha = 0.4, inherit.aes = FALSE) +
+  geom_hline(yintercept = 427, color = "grey", linetype = "dashed") + # Line for constant treatment
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(width = 0.3)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax =  mean + se.B), width = 0.1, position = position_dodge(width = 0.3)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  theme(axis.text = element_text(size = 14)) +
+  guides(color = "none") +
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+  scale_colour_manual(values = c("#009e73","#966AEA")) +
+  coord_cartesian(ylim = c(0,800))
+
+During17.Plot.CSB
+```
+```{r 20 Degree Amplitude vs Duration (Day -10)}
+During20.Plot.CSB <- ggplot(During20.CSB, aes(x = Amplitude, y = Spores, colour = Duration)) +
+  geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = 425, ymax = 547),
+            fill = "#ECECEC", alpha = 0.4, inherit.aes = FALSE) +
+  geom_hline(yintercept = 486, color = "grey", linetype = "dashed") + # Line for constant treatment
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(width = 0.3)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax =  mean + se.B), width = 0.1, position = position_dodge(width = 0.3)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  theme(axis.text = element_text(size = 14)) +
+  guides(color = "none") +
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+  scale_colour_manual(values = c("#009e73","#966AEA")) +
+  coord_cartesian(ylim = c(0,800))
+
+During20.Plot.CSB
+```
+```{r 23 Degree Amplitude vs Duration (Day -10)}
+During23.Plot.CSB <- ggplot(During23.CSB, aes(x = Amplitude, y = Spores, colour = Duration)) +
+  geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = 70, ymax = 120),
+            fill = "#ECECEC", alpha = 0.4, inherit.aes = FALSE) +
+  geom_hline(yintercept = 95, color = "grey", linetype = "dashed") + # Line for constant treatment
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(width = 0.3)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax =  mean + se.B), width = 0.1, position = position_dodge(width = 0.3)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  theme(axis.text = element_text(size = 14)) +
+  scale_y_continuous(position = "right") +
+  guides(color = "none") +
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+  scale_colour_manual(values = c("#009e73","#966AEA")) +
+  coord_cartesian(ylim = c(0,800))
+
+During23.Plot.CSB
+```
+```{r All Treatments Combination Plot (Day -10)}
+During.All.CSB <- plot_grid(During14.Plot.CSB, During17.Plot.CSB, During20.Plot.CSB, During23.Plot.CSB, 
+          ncol = 4, nrow = 1,
+          label_size = 14,
+          label_x = 0.15, label_y = 0.98)
+
+During.All.CSB
+
+ggsave("During.All.CSB.png", width = 9, height = 3.5)
+```
+
+After Amplitude vs Duration
+
+```{r Making Subsets for Interactions (Day 10)}
+After14.CSB <- subset(CSB.after, A_Temp == "14" & Amplitude %in% c("-3","-6"))
+After17.CSB <- subset(CSB.after, A_Temp == "17" & Amplitude %in% c("-3","-6")) 
+After20.CSB <- subset(CSB.after, A_Temp == "20" & Amplitude %in% c("-3","-6"))
+After23.CSB <- subset(CSB.after, A_Temp == "23" & Amplitude %in% c("-3","-6"))
+```
+
+```{r 14 Degree Amplitude vs Duration (Day 10)}
+After14.Plot.CSB <- ggplot(After14.CSB, aes(x = Amplitude, y = Spores, colour = Duration)) +
+  geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = 78, ymax = 118),
+            fill = "#ECECEC", alpha = 0.4, inherit.aes = FALSE) +
+  geom_hline(yintercept = 98, color = "grey", linetype = "dashed") + # Line for constant treatment
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(width = 0.3)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax =  mean + se.B), width = 0.1, position = position_dodge(width = 0.3)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  theme(axis.text = element_text(size = 14)) +
+  guides(color = "none") +
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+  coord_cartesian(ylim = c(0,800)) +
+  scale_colour_manual(values = c("#009e73","#966AEA"))
+  
+After14.Plot.CSB
+```
+```{r 17 Degree Amplitude vs Duration (Day 10)}
+After17.Plot.CSB <- ggplot(After17.CSB, aes(x = Amplitude, y = Spores, colour = Duration)) + 
+  geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = 386, ymax = 468),
+            fill = "#ECECEC", alpha = 0.4, inherit.aes = FALSE) +
+  geom_hline(yintercept = 427, color = "grey", linetype = "dashed") + # Line for constant treatment
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(width = 0.3)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax =  mean + se.B), width = 0.1, position = position_dodge(width = 0.3)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  theme(axis.text = element_text(size = 14)) +
+  guides(color = "none") +
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+  coord_cartesian(ylim = c(0,800)) +
+  scale_colour_manual(values = c("#009e73","#966AEA"))
+
+After17.Plot.CSB
+```
+```{r 20 Degree Amplitude vs Duration (Day 10)}
+After20.Plot.CSB <- ggplot(After20.CSB, aes(x = Amplitude, y = Spores, colour = Duration)) +
+  geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = 425, ymax = 547),
+            fill = "#ECECEC", alpha = 0.4, inherit.aes = FALSE) +
+  geom_hline(yintercept = 486, color = "grey", linetype = "dashed") + # Line for constant treatment
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(width = 0.3)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax =  mean + se.B), width = 0.1, position = position_dodge(width = 0.3)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  theme(axis.text = element_text(size = 14)) +
+  guides(color = "none") +
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+  coord_cartesian(ylim = c(0,800)) +
+  scale_colour_manual(values = c("#009e73","#966AEA"))
+
+After20.Plot.CSB
+```
+```{r 23 Degree Amplitude vs Duration (Day 10)}
+After23.Plot.CSB <- ggplot(After23.CSB, aes(x = Amplitude, y = Spores, colour = Duration)) +
+  geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = 70, ymax = 120),
+            fill = "#ECECEC", alpha = 0.4, inherit.aes = FALSE) +
+  geom_hline(yintercept = 95, color = "grey", linetype = "dashed") + # Line for constant treatment
+  stat_summary(fun = "mean", geom = "point", size = 3, position = position_dodge(width = 0.3)) +
+  geom_errorbar(aes(ymin = mean - se.B, ymax =  mean + se.B), width = 0.1, position = position_dodge(width = 0.3)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  theme(axis.text = element_text(size = 14)) +
+  scale_y_continuous(position = "right") +
+  guides(color = "none") +
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+  coord_cartesian(ylim = c(0,800)) +
+  scale_colour_manual(values = c("#009e73","#966AEA"))
+
+After23.Plot.CSB
+```
+```{r All Treatments Combination Plot (Day 10)}
+After.All.CSB <- plot_grid(After14.Plot.CSB, After17.Plot.CSB, After20.Plot.CSB, After23.Plot.CSB, 
+          ncol = 4, nrow = 1,
+          label_size = 14,
+          label_x = 0.15, label_y = 0.98)
+
+After.All.CSB
+
+ggsave("After.All.CSB.png", width = 9, height = 3.5)
+```
+
+
+
