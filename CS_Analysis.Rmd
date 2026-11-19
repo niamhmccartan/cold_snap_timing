@@ -39,7 +39,6 @@ CS <- subset(coldsnap, Include == "Yes")
 ```{r Set Variables}
 CS$A_Temp<-as.numeric(CS$A_Temp)
 CS$Real_Avg<-as.numeric(CS$Real_Avg)
-CS$Real_CS<-as.numeric(CS$Real_CS)
 CS$Bath<-as.factor(CS$Bath)
 CS$Timing<-as.factor(CS$Timing)
 CS$Amplitude<-as.factor(CS$Amplitude)
@@ -138,6 +137,11 @@ presence.CSI.linear <- glmmTMB(Infection ~ Real_Avg_Cent * Timing + (1|Bath),
 
 anova(presence.CSI.linear, presence.CSI)
 
+#post-hoc tests: timing’s linear and quadratic terms against Constant
+
+emt.CSI <- emtrends(presence.CSI, ~ Timing, var = "Real_Avg_Cent", max.degree = 2)
+emt.CSI
+contrast(emt.CSI, method = "trt.vs.ctrl", ref = "Constant", adjust = "BH")
 ```
 
 ```{r Infection Treatment Model exploration}
@@ -534,7 +538,7 @@ CSI.sev.before.plot <- ggplot(CSI.sev.before, aes(x = A_Temp, y = Prop, colour =
   theme(axis.text = element_text(size = 17),
         legend.position = "none") +
   theme(panel.border = element_rect(colour = "black", fill = NA, size = 1)) +
-  scale_shape_manual(values = c(21, 22, 23, 24, 25)) +
+  scale_shape_manual(values = c(22, 23, 24, 25)) +
   scale_fill_manual(values = c("#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +
   scale_colour_manual(values = c("#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +
   scale_linetype_manual(values = c("dashed", "dashed", "dashed", "dashed")) +
@@ -563,7 +567,7 @@ CSI.sev.during.plot <- ggplot(CSI.sev.during, aes(x = A_Temp, y = Prop, colour =
   theme(axis.text = element_text(size = 17),
         legend.position = "none") +
   theme(panel.border = element_rect(colour = "black", fill = NA, size = 1)) +
-  scale_shape_manual(values = c(21, 22, 23, 24, 25)) +
+  scale_shape_manual(values = c(22, 23, 24, 25)) +
   scale_fill_manual(values = c("#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +
   scale_colour_manual(values = c("#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +
   scale_linetype_manual(values = c("dashed", "dashed", "dashed", "dashed")) +
@@ -592,7 +596,7 @@ CSI.sev.after.plot <- ggplot(CSI.sev.after, aes(x = A_Temp, y = Prop, colour = T
   theme(axis.text = element_text(size = 17),
         legend.position = "none") +
   theme(panel.border = element_rect(colour = "black", fill = NA, size = 1)) +
-  scale_shape_manual(values = c(21, 22, 23, 24, 25)) +
+  scale_shape_manual(values = c(22, 23, 24, 25)) +
   scale_fill_manual(values = c("#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +
   scale_colour_manual(values = c("#CC79A9", "#70135C", "#57B4E9", "#0D72B2")) +
   scale_linetype_manual(values = c("dashed", "dashed", "dashed", "dashed")) +
@@ -698,7 +702,7 @@ fixef(severity.brm.full.CSB, probs = c(0.05, 0.95))
 fixef(severity.brm.reduced.CSB, probs = c(0.05, 0.95))
 ```
 
-```{r DHARMa infection model checks for fits}
+```{r DHARMa burden model checks for fits}
 sim_presence.CSB <- simulateResiduals(presence.CSB, n = 1000)
 plot(sim_presence.CSB)
 
@@ -712,7 +716,7 @@ plotResiduals(sim_presence.CSB, form = CSC.NA$Real_Avg_Cent)
 plotResiduals(sim_severity.CSB, form = CSC_snap.NA$Real_Avg_Cent)  
 ```
 
-```{r Burden model - chosen after DHARMa checks}
+```{r Burden model CHOSEN - chosen after DHARMa checks}
 presence.disp.CSB <- glmmTMB(
   Spores ~ poly(Real_Avg_Cent, 3) * Timing + (1|Bath),
   dispformula = ~ poly(Real_Avg_Cent, 3),
@@ -728,6 +732,12 @@ plotResiduals(sim_presence.disp.CSB, form = presence.disp.CSB$frame$Real_Avg_Cen
 summary(presence.disp.CSB)
 
 Anova(presence.disp.CSB, type = "III")
+
+#post-hoc tests: timing’s linear and quadratic terms against Constant
+
+emt.CSB <- emtrends(presence.disp.CSB, ~ Timing, var = "Real_Avg_Cent", max.degree = 3)
+emt.CSB
+contrast(emt.CSB, method = "trt.vs.ctrl", ref = "Constant", adjust = "BH")
 ```
 
 #Burden Contrast Comparisons
@@ -949,7 +959,6 @@ CSB.pres.before.plot
 
 ggsave("CSB.pres.before.plot.png", width = 8.5, height = 6)
 ```
-
 ```{r During Burden Presence}
 CSB.pres.during.plot <- ggplot(CSB.pres.during, aes(x = A_Temp, y = Spores, colour = Presence, shape = Presence, fill = Presence)) +
   geom_smooth(aes(x = A_Temp, y = Spores, colour = Presence, linetype = Presence),
